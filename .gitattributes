@@ -1,0 +1,30 @@
+# =========================
+# Line endings policy
+# =========================
+
+# Default: treat as text, use LF
+* text=auto eol=lf
+
+# Python
+*.py text eol=lf
+
+# YAML / JSON / Markdown
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Do not modify binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.pth binary
+*.pt binary
+*.onnx binary

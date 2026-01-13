@@ -1,0 +1,57 @@
+camera_name: dashcam_main
+version: cam_v002
+
+image_size:
+  width: 1920
+  height: 1080
+
+intrinsics:
+  model: opencv_pinhole
+  K:
+    - [1450.90386, 0.0, 944.660261]
+    - [0.0, 1453.98959, 529.630984]
+    - [0.0, 0.0, 1.0]
+  distortion_model: plumb_bob
+  D: [-0.56737988, 0.44540633, 0.01506728, 0.02283647, -0.15235153]
+
+undistort:
+  use_optimal_new_K: true
+  alpha: 0.0
+
+extrinsics:
+  reference: ground_plane
+  camera_height_m: 1.22
+  angles_deg:
+    roll: 1.04
+    pitch: 1.996
+    yaw: 0.57
+  angles_source:
+    roll_yaw: "estimated from D1.MP4 (median of valid frames)"
+    pitch: "estimated previously (VP/pitch pipeline)"
+    height: "measured"
+
+quality:
+  intrinsics_rms_reproj_px: 0.7401
+  intrinsics_mean_reproj_px: 0.0923
+  intrinsics_max_reproj_px: 0.4568
+  roll_yaw_samples_used:
+    D1:
+      roll_median_deg: 1.0385
+      yaw_median_deg: 0.5728
+      samples_kept: 32
+
+coordinate_system:
+  camera:
+    x: right
+    y: down
+    z: forward
+  world:
+    x: right
+    y: up
+    z: forward
+  note: "Ensure your IPM/BEV code matches these conventions."
+
+notes: >
+  cam_v002 locks roll/yaw using robust median from D1.
+  For deployment, you may keep roll/yaw fixed or allow small online updates within +/-2 deg.
+created_at: 2025-12-16

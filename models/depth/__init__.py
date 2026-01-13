@@ -1,0 +1,1 @@
+from .depth_anything_v2_tiny import DepthAnythingV2TinyWrapper

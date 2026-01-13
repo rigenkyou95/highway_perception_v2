@@ -1,0 +1,17 @@
+TwinLiteNetPP (use_refine=True)
+Finetune weight: twinlitenetpp_best_finetune.pth
+
+Drivable mIoU: 0.5752
+Lane     mIoU: 0.6018
+Val subset: 500 samples (recommended next: full 10k)
+
+
+On the BDD100K validation set (10,000 images, 640×360 resolution),
+our TwinLiteNetPP (with refinement head and continuity loss) achieves:
+
+- Drivable area segmentation: 57.53% mIoU
+- Lane line segmentation:     60.90% mIoU
+
+These results are obtained using our final fine-tuned weights
+(twinlitenetpp_best_finetune.pth) and will be used as the geometry
+stream backbone in the subsequent metric depth estimation experiments.

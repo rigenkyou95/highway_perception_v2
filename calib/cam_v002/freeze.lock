@@ -1,0 +1,4 @@
+camera_id=cam_v002
+frozen_at=2026-01-13T11:00:00+09:00
+frozen_by=rigenkyou
+note=baseline calibration for BEV + metric depth alignment

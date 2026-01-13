@@ -1,0 +1,19 @@
+camera_id: cam_v002
+description: "Highway surveillance camera calibration (v002)"
+
+intrinsics_file: intrinsics.yaml
+extrinsics_file: extrinsics.yaml
+bev_file: bev.yaml
+quality_file: quality.yaml
+sources_file: sources.yaml
+
+# Global conventions
+units:
+  length: m
+  angle: deg
+  pixel: px
+
+# Coordinate convention (brief)
+frames:
+  camera: "OpenCV camera frame: x right, y down, z forward"
+  world:  "Road plane frame: X right, Y forward, Z up (recommended)"

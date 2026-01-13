@@ -1,0 +1,9 @@
+[submodule "third_party/TwinLiteNet"]
+	path = third_party/TwinLiteNet
+	url = https://github.com/chequanghuy/TwinLiteNet.git
+[submodule "third_party/depth_anything_v2"]
+	path = third_party/depth_anything_v2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+[submodule "third_party/yolov11n"]
+	path = third_party/yolov11n
+	url = https://github.com/ultralytics/ultralytics

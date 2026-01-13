@@ -1,0 +1,25 @@
+camera_id: cam_v002
+
+# Mounting
+height_m: 1.22
+
+# Angles (deg)
+# pitch: positive means camera looks DOWN (common road setup) — 明确你的定义
+pitch_deg: 1.996
+roll_deg: 1.146     # 你之前输出 mean=1.1458，可写 mean 或 median
+yaw_deg: 0.631      # 你之前输出 mean=0.6314
+
+# Rotation order (must be defined!)
+# Example: R = Rz(yaw) * Ry(pitch) * Rx(roll)  (or your actual)
+rotation_order: "yaw-pitch-roll"
+rotation_convention: "R_world_to_cam"   # or "R_cam_to_world"
+
+# Translation convention (optional)
+# camera position in world frame, if you define world Z up and road plane Z=0:
+t_world: [0.0, 0.0, 1.22]
+
+# Notes for sign conventions
+signs:
+  pitch_positive: "down"
+  roll_positive: "right_down"
+  yaw_positive: "turn_right"

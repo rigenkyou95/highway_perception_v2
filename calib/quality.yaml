@@ -1,0 +1,25 @@
+camera_id: cam_v002
+created_date: "2026-01-13"
+status: frozen
+
+intrinsics:
+  reprojection_error_px: null
+  num_images: null
+
+extrinsics:
+  method: "lane-based VP + symmetry (roll/yaw) + pitch from VP (or your method)"
+  samples_kept: 32
+  roll_deg:
+    mean: 1.1458
+    median: 1.0385
+  yaw_deg:
+    mean: 0.6314
+    median: 0.5728
+  pitch_deg:
+    value: 1.996
+    source: "final chosen"
+
+acceptance:
+  bev_lane_symmetry_ok: null
+  metric_depth_anchor_ok: null
+  notes: "Fill after BEV validation run"

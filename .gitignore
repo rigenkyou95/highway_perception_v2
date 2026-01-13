@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+.env
+
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ===== Project large outputs / caches =====
+outputs/
+checkpoints/
+calib_videos/
+assets/images/*.jpg
+assets/images/*.png
+
+# ===== Model weights (very large) =====
+*.pth
+*.pt
+*.onnx
+*.engine
+*.tflite
+
+# ===== Numpy / logs =====
+*.npy
+*.npz
+*.log
+*.csv
+models/ckpts/
+outputs/
+results/
+runs/
+
+# python cache
+**/__pycache__/
+*.pyc

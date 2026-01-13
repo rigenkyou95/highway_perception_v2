@@ -1,0 +1,11 @@
+camera_id: cam_v002
+
+process_evidence_dir: "calib_videos/runs/cam_v002/"
+acceptance_snapshots_dir: "outputs/camera_extrinsic_calib/cam_v002/"
+
+files:
+  roll_yaw_csv: "outputs/camera_extrinsic_calib/cam_v002/roll_yaw_summary.csv"
+  vp_debug_frames: "calib_videos/runs/cam_v002/debug_frames/"
+  pitch_table: "calib_videos/runs/cam_v002/pitch_candidates.csv"
+  intrinsics_report: "calib_videos/runs/cam_v002/intrinsics_report.txt"
+  used_video: "calib_videos/MP4/D1.MP4"
