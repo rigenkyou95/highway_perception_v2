@@ -1,33 +1,32 @@
-Highway Perception V2
+# Highway Perception V2
 
-Highway Perception V2 is a research-oriented monocular perception system for highway scenarios, integrating lane detection, drivable area segmentation, vehicle detection, and monocular depth estimation with explicit camera geometry and calibration.
+**Highway Perception V2** is a **research-oriented monocular perception system** for highway scenarios, integrating **lane detection, drivable area segmentation, vehicle detection, and monocular depth estimation** with explicit **camera geometry and calibration**.
 
-This repository serves as the official experimental codebase for research on geometry-aware monocular road perception.
+This repository serves as the **official experimental codebase** for research on **geometry-aware monocular road perception**.
 
-Overview
+---
 
-Input: Single monocular RGB image or video (fixed camera)
+## Overview
 
-Outputs:
-
-Lane lines
-
-Drivable area
-
-Vehicles (bounding boxes)
-
-Metric-aligned depth map (geometry-guided)
+- **Input**: Single monocular RGB image or video (fixed camera)
+- **Outputs**:
+  - Lane lines
+  - Drivable area
+  - Vehicles (bounding boxes)
+  - Metric-aligned depth map (geometry-guided)
 
 The system is designed for:
+- Highway surveillance
+- Driver assistance research
+- Geometry-constrained perception under perspective distortion
 
-Highway surveillance
+---
 
-Driver assistance research
+## Method Overview
 
-Geometry-constrained perception under perspective distortion
+### System Pipeline
 
-Method Overview
-System Pipeline
+```text
 Monocular Image
       │
       ▼
@@ -40,7 +39,7 @@ Monocular Image
 ┌──────────────────────────┐
 │ Camera Geometry Module   │
 │  • Intrinsics            │
-│  • Height                │
+│  • Camera Height         │
 │  • Pitch / Roll / Yaw    │
 │  • IPM / BEV Projection  │
 └───────────┬──────────────┘
@@ -52,41 +51,51 @@ Monocular Image
 │  (relative depth)        │
 └───────────┬──────────────┘
             │
-            │ Scale alignment (geometry-guided)
+            │ Geometry-guided scale alignment
             ▼
 ┌──────────────────────────┐
 │ Metric Depth Estimation  │
 └──────────────────────────┘
+````
 
+### Parallel Branch
 
-In parallel:
-
+```text
 Monocular Image
       │
       ▼
 ┌──────────────────────────┐
 │ Vehicle Detection        │  ← YOLOv11n
 └──────────────────────────┘
+```
 
-Key Design Principles
+---
 
-Geometry before learning
-Lane structure and camera calibration provide reliable metric constraints.
+## Key Design Principles
 
-Lightweight models
-All networks are selected for real-time feasibility.
+* **Geometry before learning**
+  Lane structure and camera calibration provide reliable metric constraints.
 
-Explicit calibration
-Camera intrinsics and extrinsics are treated as first-class components, not hidden assumptions.
+* **Lightweight models**
+  All networks are selected for real-time feasibility in highway scenarios.
 
-Modular research code
-Each component can be replaced or evaluated independently.
+* **Explicit calibration**
+  Camera intrinsics and extrinsics are treated as first-class components, not hidden assumptions.
 
-Repository Structure
+* **Modular research code**
+  Each component can be replaced, evaluated, or extended independently.
+
+---
+
+## Repository Structure
+
+```text
 highway_perception_v2/
 ├── calib/                  # Camera calibration files
 │   └── cam_v002/            # Versioned camera configuration
-├── configs/                 # YAML-based configuration
+├── calib_videos/            # Calibration videos (not tracked)
+├── configs/                 # YAML-based configuration files
+│   └── camera/
 ├── detector/                # Vehicle detection wrapper
 ├── models/
 │   ├── seg/                 # Lane & drivable area segmentation
@@ -96,73 +105,87 @@ highway_perception_v2/
 │   └── train/               # Training utilities
 ├── third_party/             # External repositories (Git submodules)
 ├── outputs/                 # Inference results (ignored)
-├── notes/                   # Experiment logs
-└── README.md
+├── notes/                   # Experiment logs & research notes
+├── README.md
+└── .gitignore
+```
 
+> `outputs/`, `runs/`, and checkpoints are intentionally excluded from version control.
 
-outputs/, runs/, and checkpoints are intentionally excluded from version control.
+---
 
-Quick Usage (Inference)
-# Lane & drivable area
+## Quick Usage
+
+### Lane & Drivable Area Segmentation
+
+```bash
 python scripts/infer/test_twinlitenet_pp.py
+```
 
-# Vehicle detection
+### Vehicle Detection
+
+```bash
 python scripts/infer/test_yolo11n.py
+```
 
-# Monocular depth
+### Monocular Depth Estimation
+
+```bash
 python scripts/infer/test_depth_anything_v2.py
+```
 
-# Full pipeline (single image)
+### Full Pipeline (Single Image)
+
+```bash
 python scripts/infer/test_full_system_single_image.py
+```
 
-Camera Calibration
+---
 
-Calibration data are stored in calib/ and include:
+## Camera Calibration
 
-Camera intrinsics
+Calibration data are stored in `calib/` and include:
 
-Camera height
-
-Pitch / roll / yaw
-
-Quality and data source metadata
+* Camera intrinsics
+* Camera height
+* Pitch / roll / yaw
+* Calibration quality and data source metadata
 
 Supported operations:
 
-Lane-based pitch estimation
+* Lane-based pitch estimation
+* Roll / yaw estimation from vanishing geometry
+* IPM-based BEV projection
 
-Roll / yaw estimation from vanishing geometry
+---
 
-IPM-based BEV projection
-
-Research Scope
+## Research Scope
 
 This project focuses on:
 
-Geometry-aware monocular depth estimation
+* Geometry-aware monocular depth estimation
+* Lane-based metric scale recovery
+* Highway-specific perception constraints
+* Robust perception under occlusion and perspective distortion
 
-Lane-based metric scale recovery
+This codebase is intended **for academic research purposes only** and is **not a production-ready ADAS system**.
 
-Highway-specific perception constraints
+---
 
-Robust perception under occlusion and perspective distortion
+## Dependencies & Submodules
 
-This codebase is intended for academic research, not as a production ADAS system.
+This repository includes the following projects as **Git submodules**, each pinned to a specific commit for reproducibility:
 
-Dependencies & Submodules
+* **TwinLiteNet / TwinLiteNet++** – lane & drivable area segmentation
+* **Depth Anything V2** – monocular depth estimation
+* **Ultralytics YOLO** – vehicle detection
 
-This repository includes the following projects as Git submodules:
+---
 
-TwinLiteNet / TwinLiteNet++ – lane & drivable area segmentation
+## Author
 
-Depth Anything V2 – monocular depth estimation
-
-Ultralytics YOLO – vehicle detection
-
-Each submodule is pinned to a specific commit for reproducibility.
-
-Author
-
-Rigenkyou
+**Rigenkyou**
 PhD Researcher
 Monocular Road Perception · Geometry-aware Vision · Highway Surveillance
+
+````
