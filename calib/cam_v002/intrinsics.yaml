@@ -1,18 +1,17 @@
-camera_id: cam_v002
-model: pinhole   # or "opencv_pinhole"
-image_size:
-  width: 1920
-  height: 1080
+# calib/cam_v002/intrinsics.yaml
+# Source: camera_K.npy + camera_dist.npy (OpenCV pinhole)
 
+fx: 1450.90386
+fy: 1453.98959
+cx: 944.660261
+cy: 529.630984
+
+# 3x3 camera intrinsic matrix (OpenCV)
 K:
-  - [fx, 0.0, cx]
-  - [0.0, fy, cy]
+  - [1450.90386, 0.0, 944.660261]
+  - [0.0, 1453.98959, 529.630984]
   - [0.0, 0.0, 1.0]
 
-# Distortion (OpenCV)
-# For standard: [k1, k2, p1, p2, k3]
-D: [k1, k2, p1, p2, k3]
-
-# Optional
-newK: null        # if you computed optimal new camera matrix
-roi: null         # if you used undistort cropping
+# Distortion coefficients (OpenCV): [k1, k2, p1, p2, k3]
+dist: [-0.56737988, 0.44540633, 0.01506728, 0.02283647, -0.15235153]
+D: [-0.56737988, 0.44540633, 0.01506728, 0.02283647, -0.15235153]
