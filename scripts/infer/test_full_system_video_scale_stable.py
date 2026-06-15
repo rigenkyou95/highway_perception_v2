@@ -1,0 +1,3436 @@
+# -*- coding: utf-8 -*-
+"""
+test_full_system_video_scale_stable.py
+
+第一版目标：
+1. 逐帧运行 segmentation + depth (+ optional detection)
+2. 由 lane/road 几何生成 sparse metric depth
+3. 与 relative depth 拟合得到 s_candidate
+4. 通过 confidence + 状态机输出稳定尺度 s_final
+5. 保存可视化视频和 CSV 调试结果
+
+注意：
+- 这份脚本的“状态层、候选尺度、置信度、可视化、CSV”都已经完整写好
+- 你只需要把 3 个适配函数改成你当前项目已有实现：
+    1) build_segmentation_runner(...)
+    2) build_depth_runner(...)
+    3) build_detection_runner(...)   # 可选，可先不启用
+
+推荐先禁用 detection，把视频状态层跑起来
+"""
+
+
+import os
+import sys
+import csv
+import time   # ✅ 补这个
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import argparse
+from pathlib import Path
+
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+from typing import Tuple, Optional, List, Dict, Any
+from dataclasses import dataclass, field
+from collections import deque
+import math
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from ultralytics import YOLO
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from models.seg.twinlitenet_pp.TwinLitePP import TwinLiteNetPP
+from models.depth import DepthAnythingV2TinyWrapper
+
+
+
+# =========================================================
+# 基础工具
+# =========================================================
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def now_ms() -> float:
+    """High-resolution wall-clock time in milliseconds."""
+    return time.perf_counter() * 1000.0
+
+
+def cuda_sync_if_needed(args):
+    """
+    CUDA operations are asynchronous. Synchronizing gives more reliable per-module
+    timing, but it can add profiling overhead. Enable with --profile-sync-cuda
+    when you need accurate module-level runtime.
+    """
+    if (
+        getattr(args, "profile_sync_cuda", False)
+        and torch.cuda.is_available()
+        and "cuda" in str(getattr(args, "device", "")).lower()
+    ):
+        torch.cuda.synchronize()
+
+
+def fps_from_ms(ms: float) -> float:
+    if ms is None or not np.isfinite(ms) or ms <= 1e-9:
+        return 0.0
+    return 1000.0 / float(ms)
+
+
+def clip01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+def blend(prev_v: Optional[float], curr_v: Optional[float], alpha: float) -> Optional[float]:
+    if curr_v is None:
+        return prev_v
+    if prev_v is None:
+        return curr_v
+    return alpha * curr_v + (1.0 - alpha) * prev_v
+
+
+def median_iqr_filter(values: np.ndarray, k: float = 1.5) -> np.ndarray:
+    """
+    兼容旧接口：内部统一走 iqr_keep_mask
+    """
+    if values is None or len(values) == 0:
+        return values
+    keep = iqr_keep_mask(values, k=k)
+    return values[keep]
+
+
+def draw_text_block(img: np.ndarray, lines: List[str], x: int = 20, y: int = 30,
+                    line_h: int = 26, font_scale: float = 0.7,
+                    text_color=(255, 255, 255), bg_color=(0, 0, 0),
+                    alpha: float = 0.55) -> np.ndarray:
+    """
+    左上角信息块
+    """
+    out = img.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    max_w = 0
+    for line in lines:
+        (w, h), _ = cv2.getTextSize(line, font, font_scale, 2)
+        max_w = max(max_w, w)
+
+    box_w = max_w + 20
+    box_h = line_h * len(lines) + 16
+
+    overlay = out.copy()
+    cv2.rectangle(overlay, (x - 10, y - 24), (x - 10 + box_w, y - 24 + box_h), bg_color, -1)
+    out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+
+    cy = y
+    for line in lines:
+        cv2.putText(out, line, (x, cy), font, font_scale, text_color, 2, cv2.LINE_AA)
+        cy += line_h
+    return out
+
+
+def colorize_depth(depth: np.ndarray, valid_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    深度可视化
+    """
+    if depth is None:
+        return None
+
+    d = depth.astype(np.float32).copy()
+    if valid_mask is not None:
+        vm = valid_mask.astype(bool)
+    else:
+        vm = np.isfinite(d) & (d > 0)
+
+    vis = np.zeros((*d.shape, 3), dtype=np.uint8)
+    if vm.sum() < 10:
+        return vis
+
+    vals = d[vm]
+    vmin = np.percentile(vals, 2)
+    vmax = np.percentile(vals, 98)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    dn = np.clip((d - vmin) / (vmax - vmin), 0, 1)
+    dn = (dn * 255).astype(np.uint8)
+    vis = cv2.applyColorMap(dn, cv2.COLORMAP_TURBO)
+    vis[~vm] = 0
+    return vis
+
+
+def resize_if_needed(img: np.ndarray, width: Optional[int] = None, height: Optional[int] = None) -> np.ndarray:
+    if width is None and height is None:
+        return img
+    h, w = img.shape[:2]
+    if width is not None and height is not None:
+        return cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+    if width is not None:
+        scale = width / w
+        nh = int(h * scale)
+        return cv2.resize(img, (width, nh), interpolation=cv2.INTER_LINEAR)
+    scale = height / h
+    nw = int(w * scale)
+    return cv2.resize(img, (nw, height), interpolation=cv2.INTER_LINEAR)
+
+
+# =========================================================
+# 相机参数
+# =========================================================
+
+@dataclass
+class CameraParams:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    cam_height: float
+    pitch_deg: float
+    roll_deg: float = 0.0
+    yaw_deg: float = 0.0
+    dist: Optional[np.ndarray] = None
+
+
+def _simple_yaml_read(path: str) -> Dict[str, Any]:
+    """
+    兼容性优先：先尝试 yaml，没有就退回 OpenCV FileStorage
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+
+    # 优先 PyYAML
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 再尝试 OpenCV FileStorage
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+    if not fs.isOpened():
+        raise RuntimeError(f"Cannot parse yaml: {path}")
+    data = {}
+    for key in ["fx", "fy", "cx", "cy", "cam_height", "height", "pitch_deg", "pitch",
+                "roll_deg", "roll", "yaw_deg", "yaw", "dist"]:
+        node = fs.getNode(key)
+        if not node.empty():
+            if key == "dist":
+                mat = node.mat()
+                if mat is not None:
+                    data[key] = mat.flatten().tolist()
+            else:
+                data[key] = float(node.real())
+    fs.release()
+    return data
+
+
+def load_camera_params(cam_yaml: str) -> CameraParams:
+    """
+    支持：
+    1. 传目录：包含 intrinsics.yaml / extrinsics.yaml
+    2. 传单 yaml：里面直接含所有字段
+
+    注意：
+    这里读取的是“标定分辨率下”的原始内参。
+    如果后续 resize 图像，必须再调用 scale_camera_params() 同步缩放内参。
+    """
+    if os.path.isdir(cam_yaml):
+        intr_path = os.path.join(cam_yaml, "intrinsics.yaml")
+        ext_path = os.path.join(cam_yaml, "extrinsics.yaml")
+        intr = _simple_yaml_read(intr_path)
+        ext = _simple_yaml_read(ext_path)
+        data = {}
+        data.update(intr)
+        data.update(ext)
+    else:
+        data = _simple_yaml_read(cam_yaml)
+
+    fx = float(data.get("fx", 0.0))
+    fy = float(data.get("fy", 0.0))
+    cx = float(data.get("cx", 0.0))
+    cy = float(data.get("cy", 0.0))
+
+    cam_height = float(data.get("cam_height", data.get("height", 1.4)))
+    pitch_deg = float(data.get("pitch_deg", data.get("pitch", 0.0)))
+    roll_deg = float(data.get("roll_deg", data.get("roll", 0.0)))
+    yaw_deg = float(data.get("yaw_deg", data.get("yaw", 0.0)))
+
+    dist = data.get("dist", None)
+    if dist is not None:
+        dist = np.array(dist, dtype=np.float32).reshape(-1)
+
+    cam = CameraParams(
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        cam_height=cam_height,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        yaw_deg=yaw_deg,
+        dist=dist
+    )
+
+    print("[Camera] Loaded raw calibration:")
+    print(f"[Camera]   fx={cam.fx:.2f}, fy={cam.fy:.2f}, cx={cam.cx:.2f}, cy={cam.cy:.2f}")
+    print(f"[Camera]   H={cam.cam_height:.3f} m, pitch={cam.pitch_deg:.3f} deg")
+
+    return cam
+def scale_camera_params(cam: CameraParams,
+                        orig_w: int,
+                        orig_h: int,
+                        new_w: int,
+                        new_h: int) -> CameraParams:
+    """
+    当图像 resize 后，同步缩放相机内参。
+
+    原理：
+        fx, cx 按宽度比例缩放
+        fy, cy 按高度比例缩放
+    """
+    if orig_w <= 0 or orig_h <= 0 or new_w <= 0 or new_h <= 0:
+        return cam
+
+    sx = float(new_w) / float(orig_w)
+    sy = float(new_h) / float(orig_h)
+
+    cam_scaled = CameraParams(
+        fx=cam.fx * sx,
+        fy=cam.fy * sy,
+        cx=cam.cx * sx,
+        cy=cam.cy * sy,
+        cam_height=cam.cam_height,
+        pitch_deg=cam.pitch_deg,
+        roll_deg=cam.roll_deg,
+        yaw_deg=cam.yaw_deg,
+        dist=cam.dist
+    )
+
+    print("[Camera] Intrinsics scaled after resize:")
+    print(f"[Camera]   original size = {orig_w}x{orig_h}")
+    print(f"[Camera]   resized  size = {new_w}x{new_h}")
+    print(f"[Camera]   scale sx={sx:.4f}, sy={sy:.4f}")
+    print(f"[Camera]   fx={cam_scaled.fx:.2f}, fy={cam_scaled.fy:.2f}, cx={cam_scaled.cx:.2f}, cy={cam_scaled.cy:.2f}")
+
+    return cam_scaled
+
+def build_K(cam: CameraParams) -> np.ndarray:
+    K = np.array([
+        [cam.fx, 0.0, cam.cx],
+        [0.0, cam.fy, cam.cy],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+    return K
+
+
+def undistort_if_possible(img: np.ndarray, cam: CameraParams) -> np.ndarray:
+    if cam.dist is None or len(cam.dist) == 0:
+        return img
+    K = build_K(cam)
+    return cv2.undistort(img, K, cam.dist)
+
+
+# =========================================================
+# 状态层数据结构
+# =========================================================
+
+@dataclass
+class FrameEvidence:
+    frame_id: int
+    s_candidate: Optional[float]
+    lane_pixels: int
+    road_pixels: int
+    score_lane_visibility: float
+    score_temporal_scale_stability: float
+    score_mask_visibility: float
+    confidence: float
+    update_action: str
+    debug: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ScaleState:
+    mode: str = "INIT"     # INIT / TRACKING / HOLD
+    s_final: Optional[float] = None
+    last_good_s: Optional[float] = None
+    good_count: int = 0
+    hold_count: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=120))
+
+@dataclass
+class HoodState:
+    curve_prev: Optional[np.ndarray] = None
+    hard_mask_prev: Optional[np.ndarray] = None
+    soft_mask_prev: Optional[np.ndarray] = None
+    debug_prev: Dict[str, Any] = field(default_factory=dict)
+
+    conf_prev: float = 0.0
+    valid_count: int = 0
+    miss_count: int = 0
+
+    # For interval reuse
+    last_full_update_frame: int = -1
+    reuse_count: int = 0
+
+    # For static hood lock after warmup
+    static_locked: bool = False
+    locked_curve: Optional[np.ndarray] = None
+    locked_hard_mask: Optional[np.ndarray] = None
+    locked_soft_mask: Optional[np.ndarray] = None
+    locked_conf: float = 0.0
+    locked_debug: Dict[str, Any] = field(default_factory=dict)
+    locked_frame_id: int = -1
+
+    warmup_hood_curves: List[np.ndarray] = field(default_factory=list)
+    warmup_hood_confs: List[float] = field(default_factory=list)
+
+
+#------------------------------辅助函数-----------------------------------------------
+
+def get_device(device_str: Optional[str] = None) -> torch.device:
+    if device_str is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(device_str)
+
+
+def load_twinlitenetpp_model(weight_path: str, device: torch.device) -> TwinLiteNetPP:
+    if not os.path.isfile(weight_path):
+        raise FileNotFoundError(f"TwinLiteNetPP 权重不存在: {weight_path}")
+
+    model = TwinLiteNetPP()
+    ckpt = torch.load(weight_path, map_location=device)
+
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    else:
+        state_dict = ckpt
+
+    # 兼容 DataParallel
+    new_state = {}
+    for k, v in state_dict.items():
+        nk = k.replace("module.", "") if k.startswith("module.") else k
+        new_state[nk] = v
+
+    missing, unexpected = model.load_state_dict(new_state, strict=False)
+    print(f"[Seg] Load {weight_path}")
+    print(f"[Seg]   missing keys   : {missing}")
+    print(f"[Seg]   unexpected keys: {unexpected}")
+
+    model.to(device)
+    model.eval()
+    return model
+
+
+def load_depth_model_real(depth_ckpt: str, device: str = "cuda") -> DepthAnythingV2TinyWrapper:
+    if not os.path.isfile(depth_ckpt):
+        raise FileNotFoundError(f"DepthAnythingV2 权重不存在: {depth_ckpt}")
+    model = DepthAnythingV2TinyWrapper(ckpt_path=depth_ckpt, device=device)
+    return model
+
+
+def preprocess_seg_image(img_bgr: np.ndarray, input_size: Tuple[int, int]) -> torch.Tensor:
+    """
+    input_size: (W, H)
+    输出: [1,3,H,W], float32, 0~1
+    """
+    in_w, in_h = input_size
+    img_rs = cv2.resize(img_bgr, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+    img_rgb = cv2.cvtColor(img_rs, cv2.COLOR_BGR2RGB)
+    x = img_rgb.astype(np.float32) / 255.0
+    x = np.transpose(x, (2, 0, 1))  # HWC -> CHW
+    x = torch.from_numpy(x).unsqueeze(0)  # [1,3,H,W]
+    return x
+
+
+def logits_to_binary_mask(logits: torch.Tensor,
+                          out_hw: Tuple[int, int],
+                          threshold: float = 0.5) -> np.ndarray:
+    """
+    支持：
+    - [B,2,H,W] -> softmax class-1
+    - [B,1,H,W] -> sigmoid
+    输出 uint8 mask, 值域 {0,255}
+    """
+    if logits.dim() != 4:
+        raise ValueError(f"logits shape invalid: {tuple(logits.shape)}")
+
+    if logits.shape[1] == 2:
+        prob = torch.softmax(logits, dim=1)[:, 1:2, :, :]
+    elif logits.shape[1] == 1:
+        prob = torch.sigmoid(logits)
+    else:
+        raise ValueError(f"Unsupported logits channel number: {logits.shape[1]}")
+
+    prob = F.interpolate(prob, size=out_hw, mode="bilinear", align_corners=False)
+    prob = prob[0, 0].detach().cpu().numpy()
+    mask = (prob > threshold).astype(np.uint8) * 255
+    return mask
+
+
+def clean_binary_mask(mask: np.ndarray,
+                      k_open: int = 3,
+                      k_close: int = 5,
+                      min_area: int = 80) -> np.ndarray:
+    mask = (mask > 0).astype(np.uint8) * 255
+
+    if k_open > 0:
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker)
+
+    if k_close > 0:
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            out[labels == i] = 255
+    return out
+
+
+
+# =========================================================
+# 模型适配层
+# 你只需要把这里改成你当前项目真实实现
+# =========================================================
+
+class SegmentationRunner:
+    """
+    你需要保证 __call__(bgr_img) 返回：
+    lane_mask: np.ndarray, shape [H,W], uint8, 值域 {0,255} 或 {0,1}
+    road_mask: np.ndarray, shape [H,W], uint8, 值域 {0,255} 或 {0,1}
+    debug: dict
+    """
+    def __call__(self, bgr_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class DepthRunner:
+    """
+    你需要保证 __call__(bgr_img) 返回：
+    depth_rel: np.ndarray, shape [H,W], float32, 相对深度，值越大表示越远或越近都可以
+    debug: dict
+    注意：本脚本只要求相对深度“单调一致”，最终通过 s_final 做尺度恢复
+    """
+    def __call__(self, bgr_img: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class DetectionRunner:
+    """
+    可选，不启用也行
+    返回 list[dict], 每个 dict 至少有:
+        {"xyxy": [x1,y1,x2,y2], "conf": 0.9, "cls": 2}
+    """
+    def __call__(self, bgr_img: np.ndarray) -> List[Dict[str, Any]]:
+        return []
+
+
+def build_segmentation_runner(args) -> SegmentationRunner:
+    class _SegRunner(SegmentationRunner):
+        def __init__(self, args):
+            self.args = args
+            self.device = get_device(args.device)
+
+            self.model_da = load_twinlitenetpp_model(args.seg_da_weight, self.device)
+            self.model_lane = load_twinlitenetpp_model(args.seg_ll_weight, self.device)
+
+            self.input_size = (args.seg_input_w, args.seg_input_h)
+            self.threshold_da = args.seg_da_thresh
+            self.threshold_lane = args.seg_lane_thresh
+
+            print("[Seg] Real segmentation runner initialized")
+            print(f"[Seg] device = {self.device}")
+            print(f"[Seg] input_size = {self.input_size}")
+
+        @torch.no_grad()
+        def __call__(self, bgr_img: np.ndarray):
+            h, w = bgr_img.shape[:2]
+            x = preprocess_seg_image(bgr_img, self.input_size).to(self.device)
+
+            # 你的 TwinLiteNetPP 目前在项目里是双头输出
+            # 按你之前项目描述，forward 返回 da_logits, ll_logits
+            # 但为了稳妥，这里我们分别跑两个权重
+            da_out = self.model_da(x)
+            lane_out = self.model_lane(x)
+
+            if isinstance(da_out, (tuple, list)) and len(da_out) >= 1:
+                da_logits = da_out[0]
+            else:
+                da_logits = da_out
+
+            if isinstance(lane_out, (tuple, list)) and len(lane_out) >= 2:
+                # 如果 lane 权重模型也返回 (da_logits, ll_logits)，取第二个
+                lane_logits = lane_out[1]
+            elif isinstance(lane_out, (tuple, list)) and len(lane_out) >= 1:
+                lane_logits = lane_out[0]
+            else:
+                lane_logits = lane_out
+
+            road_mask = logits_to_binary_mask(
+                da_logits, out_hw=(h, w), threshold=self.threshold_da
+            )
+            lane_mask = logits_to_binary_mask(
+                lane_logits, out_hw=(h, w), threshold=self.threshold_lane
+            )
+
+            road_mask = clean_binary_mask(
+                road_mask,
+                k_open=args.road_open_ksize,
+                k_close=args.road_close_ksize,
+                min_area=args.road_min_area
+            )
+            lane_mask = clean_binary_mask(
+                lane_mask,
+                k_open=args.lane_open_ksize,
+                k_close=args.lane_close_ksize,
+                min_area=args.lane_min_area
+            )
+
+            debug = {
+                "placeholder": False,
+                "input_hw": (h, w),
+                "seg_input_size": self.input_size,
+                "threshold_da": self.threshold_da,
+                "threshold_lane": self.threshold_lane,
+                "road_pixels": int((road_mask > 0).sum()),
+                "lane_pixels": int((lane_mask > 0).sum()),
+            }
+
+            return lane_mask, road_mask, debug
+
+    return _SegRunner(args)
+
+
+def build_depth_runner(args) -> DepthRunner:
+    class _DepthRunner(DepthRunner):
+        def __init__(self, args):
+            self.args = args
+            self.device = str(get_device(args.device))
+            self.model = load_depth_model_real(args.depth_ckpt, device=self.device)
+
+            print("[Depth] Real depth runner initialized")
+            print(f"[Depth] device = {self.device}")
+            print(f"[Depth] ckpt   = {args.depth_ckpt}")
+
+        def __call__(self, bgr_img: np.ndarray):
+            depth_rel = self.model(bgr_img)
+            if not isinstance(depth_rel, np.ndarray):
+                depth_rel = np.array(depth_rel, dtype=np.float32)
+            depth_rel = depth_rel.astype(np.float32)
+
+            debug = {
+                "placeholder": False,
+                "shape": tuple(depth_rel.shape),
+                "min": float(np.min(depth_rel)),
+                "max": float(np.max(depth_rel)),
+                "mean": float(np.mean(depth_rel)),
+            }
+            return depth_rel, debug
+
+    return _DepthRunner(args)
+
+
+def build_detection_runner(args) -> DetectionRunner:
+    """
+    ========= 可选第三个函数 =========
+
+    第一版可以完全不接 YOLO
+    """
+    class _DetRunner(DetectionRunner):
+        def __init__(self, args):
+            self.enabled = args.enable_det
+            if self.enabled:
+                print("[Det] Placeholder detection runner initialized")
+                print("[Det] You may replace this later with YOLOv11n inference.")
+
+        def __call__(self, bgr_img: np.ndarray):
+            return []
+
+    return _DetRunner(args)
+
+
+# =========================================================
+# 几何层：从 lane / road 恢复 sparse metric depth
+# =========================================================
+
+def normalize_mask(mask: np.ndarray) -> np.ndarray:
+    if mask is None:
+        return None
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() <= 1:
+        mask = mask * 255
+    return mask
+
+
+def bottom_region_mask(h: int, w: int, y_ratio0: float = 0.55) -> np.ndarray:
+    m = np.zeros((h, w), dtype=np.uint8)
+    y0 = int(h * y_ratio0)
+    m[y0:, :] = 1
+    return m
+
+
+def center_region_mask(h: int, w: int, x_ratio: float = 0.50, width_ratio: float = 0.45, y_ratio0: float = 0.55) -> np.ndarray:
+    """
+    图像中央下半部分，用于估计道路核心可见性
+    """
+    m = np.zeros((h, w), dtype=np.uint8)
+    cx = int(w * x_ratio)
+    half_w = int(w * width_ratio * 0.5)
+    x0 = max(0, cx - half_w)
+    x1 = min(w, cx + half_w)
+    y0 = int(h * y_ratio0)
+    m[y0:, x0:x1] = 1
+    return m
+
+def keep_largest_bottom_component(mask: np.ndarray) -> np.ndarray:
+    """
+    只保留与图像底边接触的最大连通域
+    输入/输出: uint8 {0,255}
+    """
+    mask = (mask > 0).astype(np.uint8) * 255
+    h, w = mask.shape[:2]
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(mask)
+
+    bottom_labels = np.unique(labels[h - 1, :])
+    bottom_labels = [lab for lab in bottom_labels if lab != 0]
+
+    if len(bottom_labels) == 0:
+        return np.zeros_like(mask)
+
+    best_lab = None
+    best_area = -1
+    for lab in bottom_labels:
+        area = stats[lab, cv2.CC_STAT_AREA]
+        if area > best_area:
+            best_area = area
+            best_lab = lab
+
+    out = np.zeros_like(mask)
+    out[labels == best_lab] = 255
+    return out
+
+def _component_stats(mask: np.ndarray, road_mask_u8: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """
+    输入:
+        mask: uint8 {0,255} 或 {0,1}
+        road_mask_u8: 可选，用于计算候选区域与 road 的重叠率
+    """
+    mask = (mask > 0).astype(np.uint8)
+    h, w = mask.shape[:2]
+    ys, xs = np.where(mask > 0)
+
+    if len(xs) == 0:
+        return {
+            "area": 0,
+            "x_span": 0,
+            "y_span": 0,
+            "x_span_ratio": 0.0,
+            "y_span_ratio": 0.0,
+            "aspect_ratio": 0.0,
+            "bottom_touch_ratio": 0.0,
+            "road_overlap_ratio": 0.0,
+            "bbox": None,
+        }
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    area = int(len(xs))
+
+    # 注意：这里 mask 是 0/1，sum() 就是触底像素数
+    bottom_touch = int(mask[h - 1].sum())
+    bottom_touch_ratio = float(bottom_touch) / float(max(width, 1))
+
+    road_overlap_ratio = 0.0
+    if road_mask_u8 is not None:
+        road_bool = (road_mask_u8 > 0)
+        overlap = int(((mask > 0) & road_bool).sum())
+        road_overlap_ratio = float(overlap) / float(max(area, 1))
+
+    return {
+        "area": area,
+        "x_span": width,
+        "y_span": height,
+        "x_span_ratio": float(width) / float(max(w, 1)),
+        "y_span_ratio": float(height) / float(max(h, 1)),
+        "aspect_ratio": float(width) / float(max(height, 1)),
+        "bottom_touch_ratio": bottom_touch_ratio,
+        "road_overlap_ratio": road_overlap_ratio,
+        "bbox": (x0, y0, x1, y1),
+    }
+
+
+def iqr_keep_mask(values: np.ndarray, k: float = 1.5) -> np.ndarray:
+    """
+    返回 IQR 保留布尔掩码，便于同步过滤多个数组
+    """
+    if values is None or len(values) == 0:
+        return np.zeros((0,), dtype=bool)
+
+    q1 = np.percentile(values, 25)
+    q3 = np.percentile(values, 75)
+    iqr = q3 - q1
+
+    if iqr < 1e-12:
+        return np.ones_like(values, dtype=bool)
+
+    lo = q1 - k * iqr
+    hi = q3 + k * iqr
+    return (values >= lo) & (values <= hi)
+
+def _mask_from_curve(curve: np.ndarray, h: int, w: int) -> np.ndarray:
+    out = np.zeros((h, w), dtype=np.uint8)
+    for x in range(w):
+        y_top = int(curve[x])
+        out[y_top:, x] = 1
+    return out
+
+
+def _soft_mask_from_curve(curve: np.ndarray,
+                          h: int,
+                          w: int,
+                          sigma_px: float = 18.0) -> np.ndarray:
+    """
+    在边界下方置信度更高，上方快速衰减
+    """
+    yy = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    curve_f = curve.astype(np.float32).reshape(1, -1)
+    d = yy - curve_f
+    soft = 1.0 / (1.0 + np.exp(-(d / max(sigma_px, 1e-3))))
+    soft = np.clip(soft, 0.0, 1.0).astype(np.float32)
+    return soft
+
+
+def compute_hood_confidence_score(hood_debug: Dict[str, Any]) -> float:
+    if hood_debug is None:
+        return 0.0
+    if hood_debug.get("reason") != "ok":
+        return 0.0
+
+    area_score = clip01(hood_debug.get("candidate_area", 0) / max(hood_debug.get("target_area", 1), 1))
+    width_score = clip01(hood_debug.get("x_span_ratio", 0.0) / 0.35)
+    bottom_score = clip01(hood_debug.get("bottom_touch_ratio", 0.0) / 0.15)
+    temporal_score = clip01(hood_debug.get("temporal_curve_consistency", 0.0))
+
+    conf = (
+        0.28 * area_score +
+        0.28 * width_score +
+        0.18 * bottom_score +
+        0.26 * temporal_score
+    )
+    return clip01(conf)
+
+
+def _component_stats(mask: np.ndarray, road_mask_u8: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    mask = (mask > 0).astype(np.uint8)
+    h, w = mask.shape[:2]
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return {
+            "area": 0,
+            "x_span": 0,
+            "y_span": 0,
+            "x_span_ratio": 0.0,
+            "y_span_ratio": 0.0,
+            "aspect_ratio": 0.0,
+            "bottom_touch_ratio": 0.0,
+            "road_overlap_ratio": 0.0,
+            "bbox": None,
+        }
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    area = int(len(xs))
+    bottom_touch = int(mask[h - 1].sum())
+    bottom_touch_ratio = float(bottom_touch) / float(max(width, 1))
+    road_overlap_ratio = 0.0
+    if road_mask_u8 is not None:
+        road_bool = (road_mask_u8 > 0)
+        overlap = int(((mask > 0) & road_bool).sum())
+        road_overlap_ratio = float(overlap) / float(max(area, 1))
+    return {
+        "area": area,
+        "x_span": width,
+        "y_span": height,
+        "x_span_ratio": float(width) / float(max(w, 1)),
+        "y_span_ratio": float(height) / float(max(h, 1)),
+        "aspect_ratio": float(width) / float(max(height, 1)),
+        "bottom_touch_ratio": bottom_touch_ratio,
+        "road_overlap_ratio": road_overlap_ratio,
+        "bbox": (x0, y0, x1, y1),
+    }
+
+
+def iqr_keep_mask(values: np.ndarray, k: float = 1.5) -> np.ndarray:
+    if values is None or len(values) == 0:
+        return np.zeros((0,), dtype=bool)
+    q1 = np.percentile(values, 25)
+    q3 = np.percentile(values, 75)
+    iqr = q3 - q1
+    if iqr < 1e-12:
+        return np.ones_like(values, dtype=bool)
+    lo = q1 - k * iqr
+    hi = q3 + k * iqr
+    return (values >= lo) & (values <= hi)
+
+
+def _mask_from_curve(curve: np.ndarray, h: int, w: int) -> np.ndarray:
+    out = np.zeros((h, w), dtype=np.uint8)
+    for x in range(w):
+        y_top = int(curve[x])
+        out[y_top:, x] = 1
+    return out
+
+
+def _soft_mask_from_curve(curve: np.ndarray, h: int, w: int, sigma_px: float = 18.0) -> np.ndarray:
+    yy = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    curve_f = curve.astype(np.float32).reshape(1, -1)
+    d = yy - curve_f
+    soft = 1.0 / (1.0 + np.exp(-(d / max(sigma_px, 1e-3))))
+    return np.clip(soft, 0.0, 1.0).astype(np.float32)
+
+
+def _fallback_prev_hood(hood_state: HoodState, h: int, w: int, reason: str):
+    if (
+        hood_state.soft_mask_prev is not None and
+        hood_state.hard_mask_prev is not None and
+        hood_state.miss_count <= 3
+    ):
+        dbg = {
+            "reason": f"fallback_prev_{reason}",
+            "candidate_area": 0,
+            "x_span_ratio": 0.0,
+            "aspect_ratio": 0.0,
+            "bottom_touch_ratio": 0.0,
+            "curve_min_y": int(np.min(hood_state.curve_prev)) if hood_state.curve_prev is not None else None,
+            "curve_max_y": int(np.max(hood_state.curve_prev)) if hood_state.curve_prev is not None else None,
+            "hood_top_curve": hood_state.curve_prev.copy() if hood_state.curve_prev is not None else None,
+            "boundary_source": "fallback",
+            "temporal_curve_consistency": 0.5,
+            "target_area": int(max(0.08 * h * w, 1)),
+        }
+        return (
+            hood_state.soft_mask_prev.copy(),
+            hood_state.hard_mask_prev.copy(),
+            0.5 * hood_state.conf_prev,
+            dbg,
+            hood_state
+        )
+    return (
+        np.zeros((h, w), dtype=np.float32),
+        np.zeros((h, w), dtype=np.uint8),
+        0.0,
+        {"reason": reason, "boundary_source": "fallback"},
+        hood_state
+    )
+
+
+
+
+
+def compute_hood_confidence_score(hood_debug: Dict[str, Any]) -> float:
+    if hood_debug is None:
+        return 0.0
+    reason = str(hood_debug.get("reason", ""))
+    is_ok = (reason == "ok")
+    is_fallback = reason.startswith("fallback_prev_")
+    if not (is_ok or is_fallback):
+        return 0.0
+    area_score = clip01(hood_debug.get("candidate_area", 0) / max(hood_debug.get("target_area", 1), 1))
+    width_score = clip01(hood_debug.get("x_span_ratio", 0.0) / 0.35)
+    bottom_score = clip01(hood_debug.get("bottom_touch_ratio", 0.0) / 0.15)
+    temporal_score = clip01(hood_debug.get("temporal_curve_consistency", 0.0))
+    conf = (
+        0.28 * area_score +
+        0.28 * width_score +
+        0.18 * bottom_score +
+        0.26 * temporal_score
+    )
+    if is_fallback:
+        conf *= 0.75
+    return clip01(conf)
+
+
+def extract_hood_boundary_from_depth(
+        depth_rel: np.ndarray,
+        bottom_ratio: float = 0.38,
+        center_width_ratio: float = 0.92,
+        step_x: int = 8,
+        smooth_ksize: int = 31,
+        edge_percentile: float = 90.0,
+        use_large_as_near: Optional[bool] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    h, w = depth_rel.shape[:2]
+    y0 = int(h * (1.0 - bottom_ratio))
+    x_margin = int(w * (1.0 - center_width_ratio) * 0.5)
+    x0, x1 = x_margin, w - x_margin
+    roi = depth_rel[y0:, x0:x1].astype(np.float32)
+    valid = np.isfinite(roi)
+    curve = np.full((w,), -1, dtype=np.int32)
+    if valid.sum() < 50:
+        return curve, {"reason": "too_few_valid_depth", "boundary_source": "direct_depth"}
+    if use_large_as_near is None:
+        row_bot = roi[max(0, roi.shape[0] - 10):, :]
+        row_top = roi[:min(10, roi.shape[0]), :]
+        bot_mean = float(np.nanmean(row_bot))
+        top_mean = float(np.nanmean(row_top))
+        use_large_as_near = (bot_mean > top_mean)
+    for x in range(x0, x1, step_x):
+        x_local0 = x - x0
+        x_local1 = min(x1 - x0, x_local0 + step_x)
+        patch = roi[:, x_local0:x_local1]
+        patch_valid = np.isfinite(patch)
+        if patch_valid.sum() < 5:
+            continue
+        row_score = np.zeros((patch.shape[0],), dtype=np.float32)
+        for yy in range(patch.shape[0]):
+            row_vals = patch[yy][patch_valid[yy]]
+            if len(row_vals) == 0:
+                continue
+            if use_large_as_near:
+                row_score[yy] = float(np.percentile(row_vals, edge_percentile))
+            else:
+                row_score[yy] = -float(np.percentile(row_vals, 100.0 - edge_percentile))
+        if len(row_score) >= 5:
+            row_score = cv2.GaussianBlur(row_score.reshape(-1, 1), (1, 9), 0).reshape(-1)
+        grad = np.diff(row_score)
+        if len(grad) == 0:
+            continue
+        y_rel = int(np.argmax(grad))
+        y_abs = y0 + y_rel
+        curve[x:min(w, x + step_x)] = y_abs
+    valid_curve = curve >= 0
+    if valid_curve.any():
+        xs_valid = np.where(valid_curve)[0]
+        ys_valid = curve[valid_curve]
+        xs_all = np.arange(w)
+        curve = np.interp(xs_all, xs_valid, ys_valid).astype(np.int32)
+    else:
+        curve[:] = h - 1
+    if smooth_ksize > 3:
+        if smooth_ksize % 2 == 0:
+            smooth_ksize += 1
+        curve_f = cv2.GaussianBlur(curve.astype(np.float32).reshape(1, -1), (smooth_ksize, 1), 0).reshape(-1)
+        curve = np.round(curve_f).astype(np.int32)
+    curve = np.clip(curve, 0, h - 1)
+    return curve, {
+        "reason": "ok",
+        "use_large_as_near": bool(use_large_as_near),
+        "roi_y0": y0,
+        "roi_x0": x0,
+        "roi_x1": x1,
+        "curve_min_y": int(np.min(curve)),
+        "curve_max_y": int(np.max(curve)),
+        "boundary_source": "direct_depth",
+    }
+
+
+def extract_hood_top_curve(hood_candidate: np.ndarray,
+                           step_x: int = 8,
+                           smooth_ksize: int = 31,
+                           top_percentile: float = 10.0) -> np.ndarray:
+    hood_candidate = (hood_candidate > 0).astype(np.uint8)
+    h, w = hood_candidate.shape[:2]
+    curve = np.full((w,), h - 1, dtype=np.int32)
+    for x in range(0, w, step_x):
+        x1 = min(w, x + step_x)
+        col = hood_candidate[:, x:x1]
+        ys = np.where(col > 0)[0]
+        if len(ys) > 0:
+            yv = int(np.percentile(ys, top_percentile))
+            curve[x:x1] = yv
+    valid = curve < (h - 1)
+    if valid.any():
+        xs_valid = np.where(valid)[0]
+        ys_valid = curve[valid]
+        xs_all = np.arange(w)
+        curve = np.interp(xs_all, xs_valid, ys_valid).astype(np.int32)
+    if smooth_ksize > 3:
+        if smooth_ksize % 2 == 0:
+            smooth_ksize += 1
+        curve_f = cv2.GaussianBlur(curve.astype(np.float32).reshape(1, -1), (smooth_ksize, 1), 0).reshape(-1)
+        curve = np.round(curve_f).astype(np.int32)
+    return np.clip(curve, 0, h - 1)
+
+
+def build_depth_guided_hood_prior(depth_rel: np.ndarray,
+                                  road_mask: np.ndarray,
+                                  hood_state: HoodState,
+                                  bottom_ratio: float = 0.38,
+                                  center_width_ratio: float = 0.92,
+                                  near_percentile: float = 18.0,
+                                  morph_open: int = 3,
+                                  morph_close: int = 7,
+                                  min_area: int = 300,
+                                  min_x_span_ratio: float = 0.25,
+                                  min_aspect_ratio: float = 1.6,
+                                  min_bottom_touch_ratio: float = 0.08,
+                                  step_x: int = 8,
+                                  smooth_ksize: int = 31,
+                                  top_percentile: float = 10.0,
+                                  curve_ema_alpha: float = 0.35,
+                                  soft_sigma_px: float = 18.0,
+                                  boundary_step_x: int = 8,
+                                  boundary_smooth_ksize: int = 31,
+                                  edge_percentile: float = 90.0
+                                  ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any], HoodState]:
+    h, w = depth_rel.shape[:2]
+    hood_hard_mask = np.zeros((h, w), dtype=np.uint8)
+    hood_soft_mask = np.zeros((h, w), dtype=np.float32)
+    valid = np.isfinite(depth_rel)
+    if valid.sum() < 10:
+        hood_state.miss_count += 1
+        return _fallback_prev_hood(hood_state, h, w, "invalid_depth")
+    road_mask_u8 = normalize_mask(road_mask)
+
+    # direct depth boundary first
+    curve_direct, boundary_debug = extract_hood_boundary_from_depth(
+        depth_rel=depth_rel,
+        bottom_ratio=bottom_ratio,
+        center_width_ratio=center_width_ratio,
+        step_x=boundary_step_x,
+        smooth_ksize=boundary_smooth_ksize,
+        edge_percentile=edge_percentile,
+        use_large_as_near=None,
+    )
+    direct_valid = (
+        boundary_debug.get("reason") == "ok" and
+        curve_direct is not None and
+        np.mean(curve_direct) < (h - 5)
+    )
+    if direct_valid:
+        hood_top_curve_curr = curve_direct.copy()
+        temporal_curve_consistency = 0.5
+        if hood_state.curve_prev is not None and len(hood_state.curve_prev) == len(hood_top_curve_curr):
+            curve_delta = np.mean(np.abs(
+                hood_top_curve_curr.astype(np.float32) - hood_state.curve_prev.astype(np.float32)
+            ))
+            temporal_curve_consistency = clip01(np.exp(-curve_delta / 18.0))
+            hood_top_curve = np.round(
+                curve_ema_alpha * hood_top_curve_curr.astype(np.float32) +
+                (1.0 - curve_ema_alpha) * hood_state.curve_prev.astype(np.float32)
+            ).astype(np.int32)
+        else:
+            hood_top_curve = hood_top_curve_curr.copy()
+        hood_top_curve = np.clip(hood_top_curve, 0, h - 1)
+        hood_hard_mask = _mask_from_curve(hood_top_curve, h, w).astype(np.uint8)
+        hood_soft_mask = _soft_mask_from_curve(hood_top_curve, h, w, sigma_px=soft_sigma_px)
+
+        y0 = int(h * (1.0 - bottom_ratio))
+        x_margin = int(w * (1.0 - center_width_ratio) * 0.5)
+        x0, x1 = x_margin, w - x_margin
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        roi_mask[y0:, x0:x1] = 1
+        roi_bool = roi_mask > 0
+        candidate_area = int((hood_hard_mask > 0).sum())
+        ys, xs = np.where(hood_hard_mask > 0)
+        if len(xs) > 0:
+            x_span_ratio = float(xs.max() - xs.min() + 1) / float(max(w, 1))
+            aspect_ratio = float(xs.max() - xs.min() + 1) / float(max((ys.max() - ys.min() + 1), 1))
+            bottom_touch_ratio = float((hood_hard_mask[h - 1] > 0).sum()) / float(max(xs.max() - xs.min() + 1, 1))
+        else:
+            x_span_ratio = 0.0
+            aspect_ratio = 0.0
+            bottom_touch_ratio = 0.0
+        hood_debug = {
+            "reason": "ok",
+            "boundary_source": "direct_depth",
+            "roi_y0": y0,
+            "roi_x0": x0,
+            "roi_x1": x1,
+            "candidate_area": candidate_area,
+            "target_area": int(max(0.08 * h * w, 1)),
+            "x_span_ratio": x_span_ratio,
+            "aspect_ratio": aspect_ratio,
+            "bottom_touch_ratio": bottom_touch_ratio,
+            "road_overlap_ratio": 0.0,
+            "near_mode": "auto",
+            "thr_low": None,
+            "thr_high": None,
+            "curve_min_y": int(np.min(hood_top_curve)),
+            "curve_max_y": int(np.max(hood_top_curve)),
+            "hood_top_curve": hood_top_curve,
+            "hood_candidate": None,
+            "temporal_curve_consistency": temporal_curve_consistency,
+            "use_large_as_near": boundary_debug.get("use_large_as_near"),
+        }
+        hood_conf = compute_hood_confidence_score(hood_debug)
+        hood_state.curve_prev = hood_top_curve.copy()
+        hood_state.hard_mask_prev = hood_hard_mask.copy()
+        hood_state.soft_mask_prev = hood_soft_mask.copy()
+        hood_state.conf_prev = hood_conf
+        hood_state.valid_count += 1
+        hood_state.miss_count = 0
+        return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+    # fallback to candidate-based method
+    y0 = int(h * (1.0 - bottom_ratio))
+    x_margin = int(w * (1.0 - center_width_ratio) * 0.5)
+    x0, x1 = x_margin, w - x_margin
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    roi_mask[y0:, x0:x1] = 1
+    valid_roi = valid & (roi_mask > 0)
+    if valid_roi.sum() < 50:
+        hood_state.miss_count += 1
+        return _fallback_prev_hood(hood_state, h, w, "too_few_roi_depth")
+
+    vals = depth_rel[valid_roi]
+    thr_low = float(np.percentile(vals, near_percentile))
+    thr_high = float(np.percentile(vals, 100.0 - near_percentile))
+    near_mask_small = ((depth_rel <= thr_low) & valid_roi).astype(np.uint8) * 255
+    near_mask_large = ((depth_rel >= thr_high) & valid_roi).astype(np.uint8) * 255
+
+    def refine(mask_in: np.ndarray) -> np.ndarray:
+        mask = mask_in.copy()
+        if morph_open > 0:
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_open, morph_open))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker)
+        if morph_close > 0:
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_close, morph_close))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker)
+        return mask
+
+    near_mask_small = refine(near_mask_small)
+    near_mask_large = refine(near_mask_large)
+    road_loose = cv2.dilate(
+        (road_mask_u8 > 0).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+        iterations=1
+    )
+    cand_small = keep_largest_bottom_component(near_mask_small)
+    cand_large = keep_largest_bottom_component(near_mask_large)
+    stat_small = _component_stats(cand_small, road_mask_u8=road_loose)
+    stat_large = _component_stats(cand_large, road_mask_u8=road_loose)
+
+    def score_candidate(stat: Dict[str, Any]) -> float:
+        if stat["area"] <= 0:
+            return -1.0
+        score = 0.0
+        score += 1.0 * clip01(stat["x_span_ratio"] / max(min_x_span_ratio, 1e-6))
+        score += 0.7 * clip01(stat["aspect_ratio"] / max(min_aspect_ratio, 1e-6))
+        score += 0.7 * clip01(stat["bottom_touch_ratio"] / max(min_bottom_touch_ratio, 1e-6))
+        score += 0.5 * clip01(stat["area"] / max(min_area, 1))
+        score += 1.1 * clip01(stat["road_overlap_ratio"] / 0.55)
+        return score
+
+    score_small = score_candidate(stat_small)
+    score_large = score_candidate(stat_large)
+    if score_large > score_small:
+        hood_candidate = cand_large
+        cand_stat = stat_large
+        near_mode = "large_is_near"
+    else:
+        hood_candidate = cand_small
+        cand_stat = stat_small
+        near_mode = "small_is_near"
+
+    candidate_area = cand_stat["area"]
+    x_span_ratio = cand_stat["x_span_ratio"]
+    aspect_ratio = cand_stat["aspect_ratio"]
+    bottom_touch_ratio = cand_stat["bottom_touch_ratio"]
+    road_overlap_ratio = cand_stat["road_overlap_ratio"]
+
+    ok_geom = (
+        candidate_area >= min_area and
+        x_span_ratio >= min_x_span_ratio and
+        aspect_ratio >= min_aspect_ratio and
+        bottom_touch_ratio >= min_bottom_touch_ratio
+    )
+    if not ok_geom:
+        hood_state.miss_count += 1
+        return _fallback_prev_hood(hood_state, h, w, "candidate_rejected")
+
+    hood_top_curve_curr = extract_hood_top_curve(
+        hood_candidate, step_x=step_x, smooth_ksize=smooth_ksize, top_percentile=top_percentile
+    )
+    temporal_curve_consistency = 0.5
+    if hood_state.curve_prev is not None and len(hood_state.curve_prev) == len(hood_top_curve_curr):
+        curve_delta = np.mean(np.abs(
+            hood_top_curve_curr.astype(np.float32) - hood_state.curve_prev.astype(np.float32)
+        ))
+        temporal_curve_consistency = clip01(np.exp(-curve_delta / 18.0))
+        hood_top_curve = np.round(
+            curve_ema_alpha * hood_top_curve_curr.astype(np.float32) +
+            (1.0 - curve_ema_alpha) * hood_state.curve_prev.astype(np.float32)
+        ).astype(np.int32)
+    else:
+        hood_top_curve = hood_top_curve_curr.copy()
+    hood_top_curve = np.clip(hood_top_curve, 0, h - 1)
+    hood_hard_mask = _mask_from_curve(hood_top_curve, h, w).astype(np.uint8)
+    hood_soft_mask = _soft_mask_from_curve(hood_top_curve, h, w, sigma_px=soft_sigma_px)
+    road_loose_f = (road_loose > 0).astype(np.float32)
+    hood_soft_mask = np.minimum(hood_soft_mask, 0.25 + 0.75 * road_loose_f)
+    hood_soft_mask = np.clip(hood_soft_mask, 0.0, 1.0)
+    hood_debug = {
+        "reason": "ok",
+        "boundary_source": "candidate_mask",
+        "roi_y0": y0,
+        "roi_x0": x0,
+        "roi_x1": x1,
+        "near_percentile": near_percentile,
+        "candidate_area": candidate_area,
+        "target_area": int(max(0.08 * h * w, 1)),
+        "x_span_ratio": x_span_ratio,
+        "aspect_ratio": aspect_ratio,
+        "bottom_touch_ratio": bottom_touch_ratio,
+        "road_overlap_ratio": road_overlap_ratio,
+        "area_small": stat_small["area"],
+        "area_large": stat_large["area"],
+        "near_mode": near_mode,
+        "thr_low": thr_low,
+        "thr_high": thr_high,
+        "curve_min_y": int(np.min(hood_top_curve)),
+        "curve_max_y": int(np.max(hood_top_curve)),
+        "hood_top_curve": hood_top_curve,
+        "hood_candidate": hood_candidate,
+        "temporal_curve_consistency": temporal_curve_consistency,
+    }
+    hood_conf = compute_hood_confidence_score(hood_debug)
+    hood_state.curve_prev = hood_top_curve.copy()
+    hood_state.hard_mask_prev = hood_hard_mask.copy()
+    hood_state.soft_mask_prev = hood_soft_mask.copy()
+    hood_state.conf_prev = hood_conf
+    hood_state.valid_count += 1
+    hood_state.miss_count = 0
+    return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+
+
+def _copy_hood_debug_for_cache(hood_debug: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Store a lightweight copy of hood_debug.
+    Avoid caching large candidate masks unnecessarily.
+    """
+    if hood_debug is None:
+        return {}
+
+    out = {}
+    for k, v in hood_debug.items():
+        if k == "hood_candidate":
+            continue
+
+        if isinstance(v, np.ndarray):
+            out[k] = v.copy()
+        else:
+            out[k] = v
+
+    return out
+
+
+def _smooth_static_hood_curve(curve: np.ndarray,
+                              img_h: int,
+                              smooth_ksize: int = 101) -> np.ndarray:
+    """
+    Strongly smooth the locked hood boundary.
+
+    This is stronger than per-frame smoothing because the hood boundary is
+    assumed to be static after warmup.
+    """
+    curve = np.asarray(curve, dtype=np.float32).reshape(-1)
+    w = len(curve)
+
+    valid = np.isfinite(curve)
+    if valid.sum() < 2:
+        curve = np.nan_to_num(curve, nan=float(img_h - 1))
+    else:
+        xs = np.arange(w)
+        curve = np.interp(xs, xs[valid], curve[valid]).astype(np.float32)
+
+    if smooth_ksize > 3:
+        if smooth_ksize % 2 == 0:
+            smooth_ksize += 1
+
+        max_ksize = (w // 2) * 2 + 1
+        smooth_ksize = min(smooth_ksize, max_ksize)
+
+        curve = cv2.GaussianBlur(
+            curve.reshape(1, -1),
+            (smooth_ksize, 1),
+            0
+        ).reshape(-1)
+
+    curve = np.clip(curve, 0, img_h - 1)
+    return np.round(curve).astype(np.int32)
+
+
+def _build_locked_hood_debug(curve: np.ndarray,
+                             hard_mask: np.ndarray,
+                             conf: float,
+                             frame_id: int,
+                             source: str) -> Dict[str, Any]:
+    h, w = hard_mask.shape[:2]
+    ys, xs = np.where(hard_mask > 0)
+
+    if len(xs) > 0:
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        area = int(len(xs))
+        bottom_touch_ratio = float((hard_mask[h - 1] > 0).sum()) / float(max(width, 1))
+        x_span_ratio = float(width) / float(max(w, 1))
+        aspect_ratio = float(width) / float(max(height, 1))
+    else:
+        area = 0
+        bottom_touch_ratio = 0.0
+        x_span_ratio = 0.0
+        aspect_ratio = 0.0
+
+    return {
+        "reason": "static_locked_hood",
+        "boundary_source": source,
+        "hood_reused": True,
+        "hood_locked": True,
+        "reused": True,
+        "reuse_age": 0,
+        "hood_reuse_age": 0,
+        "last_full_update_frame": int(frame_id),
+        "candidate_area": int(area),
+        "target_area": int(max(0.08 * h * w, 1)),
+        "x_span_ratio": float(x_span_ratio),
+        "aspect_ratio": float(aspect_ratio),
+        "bottom_touch_ratio": float(bottom_touch_ratio),
+        "road_overlap_ratio": 0.0,
+        "near_mode": "static_lock",
+        "curve_min_y": int(np.min(curve)),
+        "curve_max_y": int(np.max(curve)),
+        "hood_top_curve": curve.copy(),
+        "temporal_curve_consistency": 1.0,
+        "locked_conf": float(conf),
+    }
+
+
+def _try_lock_static_hood(hood_state: HoodState,
+                          img_h: int,
+                          img_w: int,
+                          frame_id: int,
+                          args) -> bool:
+    """
+    Build one static hood prior from warmup curves.
+    """
+    min_valid = int(getattr(args, "hood_lock_min_valid", 3))
+
+    if len(hood_state.warmup_hood_curves) < min_valid:
+        # Conservative fallback: if warmup did not produce enough high-confidence
+        # curves, use the latest curve when available. This avoids repeatedly
+        # running the expensive hood extractor forever.
+        if hood_state.curve_prev is None:
+            return False
+        curves = np.stack([hood_state.curve_prev], axis=0).astype(np.float32)
+        confs = np.array([float(hood_state.conf_prev)], dtype=np.float32)
+        source_suffix = "fallback_prev"
+    else:
+        curves = np.stack(hood_state.warmup_hood_curves, axis=0).astype(np.float32)
+        confs = np.array(hood_state.warmup_hood_confs, dtype=np.float32)
+        source_suffix = None
+
+    lock_mode = str(getattr(args, "hood_lock_mode", "median"))
+
+    if lock_mode == "best":
+        best_idx = int(np.argmax(confs))
+        locked_curve = curves[best_idx]
+        locked_conf = float(confs[best_idx])
+        source = "static_warmup_best"
+    else:
+        locked_curve = np.median(curves, axis=0)
+        locked_conf = float(np.median(confs)) if len(confs) > 0 else float(hood_state.conf_prev)
+        source = "static_warmup_median"
+
+    if source_suffix is not None:
+        source = f"{source}_{source_suffix}"
+
+    locked_curve = _smooth_static_hood_curve(
+        locked_curve,
+        img_h=img_h,
+        smooth_ksize=int(getattr(args, "hood_lock_smooth_ksize", 101))
+    )
+
+    locked_hard_mask = _mask_from_curve(locked_curve, img_h, img_w).astype(np.uint8)
+    locked_soft_mask = _soft_mask_from_curve(
+        locked_curve,
+        img_h,
+        img_w,
+        sigma_px=float(getattr(args, "hood_lock_soft_sigma_px", getattr(args, "hood_soft_sigma_px", 18.0)))
+    )
+
+    locked_debug = _build_locked_hood_debug(
+        curve=locked_curve,
+        hard_mask=locked_hard_mask,
+        conf=locked_conf,
+        frame_id=frame_id,
+        source=source,
+    )
+
+    hood_state.static_locked = True
+    hood_state.locked_curve = locked_curve.copy()
+    hood_state.locked_hard_mask = locked_hard_mask.copy()
+    hood_state.locked_soft_mask = locked_soft_mask.copy()
+    hood_state.locked_conf = float(locked_conf)
+    hood_state.locked_debug = _copy_hood_debug_for_cache(locked_debug)
+    hood_state.locked_frame_id = int(frame_id)
+
+    hood_state.curve_prev = locked_curve.copy()
+    hood_state.hard_mask_prev = locked_hard_mask.copy()
+    hood_state.soft_mask_prev = locked_soft_mask.copy()
+    hood_state.conf_prev = float(locked_conf)
+    hood_state.debug_prev = _copy_hood_debug_for_cache(locked_debug)
+
+    print(
+        "[hood-lock]",
+        f"frame={frame_id}",
+        f"mode={lock_mode}",
+        f"valid_curves={len(hood_state.warmup_hood_curves)}",
+        f"conf={locked_conf:.3f}",
+        f"curve_min_y={int(np.min(locked_curve))}",
+        f"curve_max_y={int(np.max(locked_curve))}",
+    )
+
+    return True
+
+
+def _return_locked_static_hood(frame_id: int,
+                               hood_state: HoodState) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any], HoodState]:
+    age = max(0, frame_id - hood_state.locked_frame_id)
+
+    hood_soft_mask = hood_state.locked_soft_mask.copy()
+    hood_hard_mask = hood_state.locked_hard_mask.copy()
+    hood_conf = float(hood_state.locked_conf)
+
+    hood_debug = dict(hood_state.locked_debug) if isinstance(hood_state.locked_debug, dict) else {}
+    hood_debug["reason"] = "static_locked_hood"
+    hood_debug["hood_reused"] = True
+    hood_debug["hood_locked"] = True
+    hood_debug["reused"] = True
+    hood_debug["reuse_age"] = int(age)
+    hood_debug["hood_reuse_age"] = int(age)
+    hood_debug["last_full_update_frame"] = int(hood_state.locked_frame_id)
+    hood_debug["hood_conf_after_decay"] = float(hood_conf)
+
+    if hood_state.locked_curve is not None:
+        hood_debug["hood_top_curve"] = hood_state.locked_curve.copy()
+        hood_debug["curve_min_y"] = int(np.min(hood_state.locked_curve))
+        hood_debug["curve_max_y"] = int(np.max(hood_state.locked_curve))
+
+    hood_state.reuse_count += 1
+
+    return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+
+def get_or_update_hood_prior(frame_id: int,
+                             depth_rel: np.ndarray,
+                             road_mask: np.ndarray,
+                             hood_state: HoodState,
+                             args) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any], HoodState]:
+    """
+    Hood prior policy.
+
+    Default behavior:
+        1. Run full hood extraction during the first N frames.
+        2. Collect valid hood curves.
+        3. Lock a smoothed static hood prior.
+        4. Reuse the locked hood prior for the rest of the video.
+
+    If --hood-lock-after-frames <= 0:
+        fall back to interval-based reuse using --hood-update-interval.
+    """
+    h, w = depth_rel.shape[:2]
+
+    lock_after = int(getattr(args, "hood_lock_after_frames", 10))
+
+    # -----------------------------------------------------
+    # Static locked hood mode
+    # -----------------------------------------------------
+    if lock_after > 0:
+        if (
+            hood_state.static_locked and
+            hood_state.locked_soft_mask is not None and
+            hood_state.locked_hard_mask is not None and
+            hood_state.locked_soft_mask.shape[:2] == (h, w) and
+            hood_state.locked_hard_mask.shape[:2] == (h, w)
+        ):
+            return _return_locked_static_hood(frame_id, hood_state)
+
+        # Before lock: full hood extraction every frame.
+        hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state = build_depth_guided_hood_prior(
+            depth_rel=depth_rel,
+            road_mask=road_mask,
+            hood_state=hood_state,
+            bottom_ratio=args.hood_bottom_ratio,
+            center_width_ratio=args.hood_center_width_ratio,
+            near_percentile=args.hood_near_percentile,
+            morph_open=args.hood_open_ksize,
+            morph_close=args.hood_close_ksize,
+            min_area=args.hood_min_area,
+            min_x_span_ratio=args.hood_min_x_span_ratio,
+            min_aspect_ratio=args.hood_min_aspect_ratio,
+            min_bottom_touch_ratio=args.hood_min_bottom_touch_ratio,
+            step_x=args.hood_step_x,
+            smooth_ksize=args.hood_smooth_ksize,
+            top_percentile=args.hood_top_percentile,
+            curve_ema_alpha=args.hood_curve_ema_alpha,
+            soft_sigma_px=args.hood_soft_sigma_px,
+            boundary_step_x=args.hood_boundary_step_x,
+            boundary_smooth_ksize=args.hood_boundary_smooth_ksize,
+            edge_percentile=args.hood_edge_percentile,
+        )
+
+        hood_debug["hood_reused"] = False
+        hood_debug["hood_locked"] = False
+        hood_debug["reused"] = False
+        hood_debug["reuse_age"] = 0
+        hood_debug["hood_reuse_age"] = 0
+        hood_debug["last_full_update_frame"] = int(frame_id)
+
+        min_conf = float(getattr(args, "hood_lock_min_conf", 0.30))
+        curve = hood_debug.get("hood_top_curve", None)
+
+        if (
+            curve is not None and
+            isinstance(curve, np.ndarray) and
+            len(curve) == w and
+            hood_conf >= min_conf
+        ):
+            hood_state.warmup_hood_curves.append(curve.copy())
+            hood_state.warmup_hood_confs.append(float(hood_conf))
+
+        # Try to lock after warmup frames.
+        if (frame_id + 1) >= lock_after:
+            locked = _try_lock_static_hood(
+                hood_state=hood_state,
+                img_h=h,
+                img_w=w,
+                frame_id=frame_id,
+                args=args,
+            )
+            if locked:
+                return _return_locked_static_hood(frame_id, hood_state)
+
+        return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+    # -----------------------------------------------------
+    # Fallback: interval-based reuse mode
+    # -----------------------------------------------------
+    interval = max(1, int(args.hood_update_interval))
+    decay = float(args.hood_reuse_conf_decay)
+
+    has_valid_cache = (
+        hood_state.soft_mask_prev is not None and
+        hood_state.hard_mask_prev is not None and
+        hood_state.soft_mask_prev.shape[:2] == (h, w) and
+        hood_state.hard_mask_prev.shape[:2] == (h, w) and
+        hood_state.conf_prev > 0.05
+    )
+
+    need_full_update = False
+
+    if interval <= 1:
+        need_full_update = True
+    elif not has_valid_cache:
+        need_full_update = True
+    elif hood_state.last_full_update_frame < 0:
+        need_full_update = True
+    elif (frame_id - hood_state.last_full_update_frame) >= interval:
+        need_full_update = True
+
+    if not need_full_update:
+        age = max(0, frame_id - hood_state.last_full_update_frame)
+
+        hood_soft_mask = hood_state.soft_mask_prev.copy()
+        hood_hard_mask = hood_state.hard_mask_prev.copy()
+
+        hood_conf = float(hood_state.conf_prev) * (decay ** age)
+        hood_conf = clip01(hood_conf)
+
+        hood_debug = dict(hood_state.debug_prev) if isinstance(hood_state.debug_prev, dict) else {}
+
+        if "hood_top_curve" not in hood_debug and hood_state.curve_prev is not None:
+            hood_debug["hood_top_curve"] = hood_state.curve_prev.copy()
+
+        hood_debug["reason"] = "reuse_prev_hood"
+        hood_debug["boundary_source"] = hood_debug.get("boundary_source", "reuse")
+        hood_debug["hood_reused"] = True
+        hood_debug["hood_locked"] = False
+        hood_debug["reused"] = True
+        hood_debug["reuse_age"] = int(age)
+        hood_debug["hood_reuse_age"] = int(age)
+        hood_debug["last_full_update_frame"] = int(hood_state.last_full_update_frame)
+        hood_debug["hood_conf_before_decay"] = float(hood_state.conf_prev)
+        hood_debug["hood_conf_after_decay"] = float(hood_conf)
+
+        if hood_state.curve_prev is not None:
+            hood_debug["curve_min_y"] = int(np.min(hood_state.curve_prev))
+            hood_debug["curve_max_y"] = int(np.max(hood_state.curve_prev))
+
+        hood_state.reuse_count += 1
+
+        return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+    hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state = build_depth_guided_hood_prior(
+        depth_rel=depth_rel,
+        road_mask=road_mask,
+        hood_state=hood_state,
+        bottom_ratio=args.hood_bottom_ratio,
+        center_width_ratio=args.hood_center_width_ratio,
+        near_percentile=args.hood_near_percentile,
+        morph_open=args.hood_open_ksize,
+        morph_close=args.hood_close_ksize,
+        min_area=args.hood_min_area,
+        min_x_span_ratio=args.hood_min_x_span_ratio,
+        min_aspect_ratio=args.hood_min_aspect_ratio,
+        min_bottom_touch_ratio=args.hood_min_bottom_touch_ratio,
+        step_x=args.hood_step_x,
+        smooth_ksize=args.hood_smooth_ksize,
+        top_percentile=args.hood_top_percentile,
+        curve_ema_alpha=args.hood_curve_ema_alpha,
+        soft_sigma_px=args.hood_soft_sigma_px,
+        boundary_step_x=args.hood_boundary_step_x,
+        boundary_smooth_ksize=args.hood_boundary_smooth_ksize,
+        edge_percentile=args.hood_edge_percentile,
+    )
+
+    hood_debug["hood_reused"] = False
+    hood_debug["hood_locked"] = False
+    hood_debug["reused"] = False
+    hood_debug["reuse_age"] = 0
+    hood_debug["hood_reuse_age"] = 0
+    hood_debug["last_full_update_frame"] = int(frame_id)
+
+    if hood_soft_mask is not None and hood_hard_mask is not None:
+        hood_state.soft_mask_prev = hood_soft_mask.copy()
+        hood_state.hard_mask_prev = hood_hard_mask.copy()
+
+        if "hood_top_curve" in hood_debug and hood_debug["hood_top_curve"] is not None:
+            hood_state.curve_prev = hood_debug["hood_top_curve"].copy()
+
+        hood_state.conf_prev = float(hood_conf)
+        hood_state.debug_prev = _copy_hood_debug_for_cache(hood_debug)
+        hood_state.last_full_update_frame = int(frame_id)
+
+    return hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state
+
+
+def extract_centerline_samples(lane_mask: np.ndarray, road_mask: np.ndarray,
+                               sample_step_y: int = 8,
+                               min_points_per_row: int = 2) -> np.ndarray:
+    """
+    从 lane/road 中抽一批道路中轴采样点，返回 Nx2 -> (x, y)
+
+    第一版思路尽量简单：
+    - 只在下半图采样
+    - 若某一行 lane 像素够多，则用该行 lane 像素的均值作为中轴 x
+    - 若 lane 太稀疏，则退回 road 中线
+    """
+    lane_mask = normalize_mask(lane_mask)
+    road_mask = normalize_mask(road_mask)
+
+    h, w = lane_mask.shape[:2]
+    points = []
+    y0 = int(h * 0.55)
+
+    for y in range(h - 1, y0, -sample_step_y):
+        lane_xs = np.where(lane_mask[y] > 0)[0]
+        if len(lane_xs) >= min_points_per_row:
+            x = int(np.mean(lane_xs))
+            points.append([x, y])
+            continue
+
+        road_xs = np.where(road_mask[y] > 0)[0]
+        if len(road_xs) >= 10:
+            x = int(np.mean(road_xs))
+            points.append([x, y])
+
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    return np.array(points, dtype=np.int32)
+
+def extract_support_region_points_with_hood_prior(
+        road_mask: np.ndarray,
+        lane_mask: np.ndarray,
+        hood_soft_mask: np.ndarray,
+        y_ratio0: float = 0.45,
+        center_width_ratio: float = 0.50,
+        sample_step_y: int = 8,
+        sample_step_x: int = 12,
+        min_row_width: int = 20,
+        hood_penalty_lambda: float = 0.85,
+        min_point_weight: float = 0.20,
+        lane_center_sigma_px: float = 80.0,
+        lane_weight_alpha: float = 0.35
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    road 内采样 + hood soft 抑制 + lane 中心优先
+    输出:
+        points_xy: [N,2]
+        point_weights: [N]
+        debug
+    """
+    road_mask = normalize_mask(road_mask)
+    lane_mask = normalize_mask(lane_mask)
+
+    h, w = road_mask.shape[:2]
+    y0 = int(h * y_ratio0)
+
+    points = []
+    point_weights = []
+    row_counts = []
+    row_mean_weights = []
+    row_lane_centers = []
+
+    for y in range(h - 1, y0 - 1, -sample_step_y):
+        road_xs = np.where(road_mask[y] > 0)[0]
+        if len(road_xs) < min_row_width:
+            row_counts.append(0)
+            row_mean_weights.append(0.0)
+            row_lane_centers.append(-1)
+            continue
+
+        x_left = int(road_xs.min())
+        x_right = int(road_xs.max())
+        row_width = x_right - x_left + 1
+        if row_width < min_row_width:
+            row_counts.append(0)
+            row_mean_weights.append(0.0)
+            row_lane_centers.append(-1)
+            continue
+
+        road_center = 0.5 * (x_left + x_right)
+
+        lane_xs = np.where(lane_mask[y] > 0)[0]
+        if len(lane_xs) >= 2:
+            lane_center = float(np.median(lane_xs))
+        else:
+            lane_center = road_center
+
+        row_lane_centers.append(float(lane_center))
+
+        half_keep = 0.5 * row_width * center_width_ratio
+        keep_left = max(0, int(lane_center - half_keep))
+        keep_right = min(w - 1, int(lane_center + half_keep))
+
+        valid_xs = np.arange(keep_left, keep_right + 1, sample_step_x, dtype=np.int32)
+
+        keep_num = 0
+        weights_this_row = []
+
+        for x in valid_xs:
+            if road_mask[y, x] <= 0:
+                continue
+
+            # hood penalty：车头 prior 越高，点越不可信
+            hood_penalty = float(hood_soft_mask[y, x])
+            w_hood = 1.0 - hood_penalty_lambda * hood_penalty
+            w_hood = float(np.clip(w_hood, 0.0, 1.0))
+
+            # lane-center prior：越靠近 lane center，点越优先
+            dx = float(x) - float(lane_center)
+            w_lane = float(np.exp(-(dx * dx) / (2.0 * lane_center_sigma_px * lane_center_sigma_px)))
+
+            # 融合：hood 是惩罚，lane 是加权优先
+            w_pt = w_hood * (1.0 - lane_weight_alpha + lane_weight_alpha * w_lane)
+            w_pt = float(np.clip(w_pt, 0.0, 1.0))
+
+            if w_pt < min_point_weight:
+                continue
+
+            points.append([x, y])
+            point_weights.append(w_pt)
+            weights_this_row.append(w_pt)
+            keep_num += 1
+
+        row_counts.append(keep_num)
+        row_mean_weights.append(float(np.mean(weights_this_row)) if len(weights_this_row) > 0 else 0.0)
+
+    if len(points) == 0:
+        return (
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros((0,), dtype=np.float32),
+            {
+                "num_points": 0,
+                "row_counts": row_counts,
+                "row_mean_weights": row_mean_weights,
+                "row_lane_centers": row_lane_centers,
+                "y_ratio0": y_ratio0,
+                "center_width_ratio": center_width_ratio,
+                "hood_penalty_lambda": hood_penalty_lambda,
+                "min_point_weight": min_point_weight,
+                "lane_center_sigma_px": lane_center_sigma_px,
+                "lane_weight_alpha": lane_weight_alpha,
+            }
+        )
+
+    return (
+        np.array(points, dtype=np.int32),
+        np.array(point_weights, dtype=np.float32),
+        {
+            "num_points": len(points),
+            "row_counts": row_counts,
+            "row_mean_weights": row_mean_weights,
+            "row_lane_centers": row_lane_centers,
+            "y_ratio0": y_ratio0,
+            "center_width_ratio": center_width_ratio,
+            "hood_penalty_lambda": hood_penalty_lambda,
+            "min_point_weight": min_point_weight,
+            "lane_center_sigma_px": lane_center_sigma_px,
+            "lane_weight_alpha": lane_weight_alpha,
+        }
+    )
+
+def extract_support_region_points(road_mask: np.ndarray,
+                                  lane_mask: np.ndarray,
+                                  y_ratio0: float = 0.45,
+                                  center_width_ratio: float = 0.50,
+                                  sample_step_y: int = 8,
+                                  sample_step_x: int = 12,
+                                  min_row_width: int = 20) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    从可行驶区域中提取“中心带状支撑区域”采样点，而不是每行一个中心点。
+    返回:
+        points_xy: [N,2] -> (x, y)
+        debug: dict
+    """
+    road_mask = normalize_mask(road_mask)
+    lane_mask = normalize_mask(lane_mask)
+
+    h, w = road_mask.shape[:2]
+    y0 = int(h * y_ratio0)
+
+    points = []
+    band_counts = []
+
+    for y in range(h - 1, y0 - 1, -sample_step_y):
+        road_xs = np.where(road_mask[y] > 0)[0]
+        if len(road_xs) < min_row_width:
+            band_counts.append(0)
+            continue
+
+        x_left = int(road_xs.min())
+        x_right = int(road_xs.max())
+        row_width = x_right - x_left + 1
+        if row_width < min_row_width:
+            band_counts.append(0)
+            continue
+
+        row_center = 0.5 * (x_left + x_right)
+        half_keep = 0.5 * row_width * center_width_ratio
+
+        keep_left = max(0, int(row_center - half_keep))
+        keep_right = min(w - 1, int(row_center + half_keep))
+
+        valid_xs = np.arange(keep_left, keep_right + 1, sample_step_x, dtype=np.int32)
+
+        # 只保留 road 内部点
+        keep_num = 0
+        for x in valid_xs:
+            if road_mask[y, x] > 0:
+                points.append([x, y])
+                keep_num += 1
+
+        band_counts.append(keep_num)
+
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.int32), {
+            "num_points": 0,
+            "y_ratio0": y_ratio0,
+            "center_width_ratio": center_width_ratio,
+            "sample_step_y": sample_step_y,
+            "sample_step_x": sample_step_x,
+            "band_counts": band_counts,
+        }
+
+    return np.array(points, dtype=np.int32), {
+        "num_points": len(points),
+        "y_ratio0": y_ratio0,
+        "center_width_ratio": center_width_ratio,
+        "sample_step_y": sample_step_y,
+        "sample_step_x": sample_step_x,
+        "band_counts": band_counts,
+    }
+
+
+def estimate_sparse_metric_depth_from_geometry(points_xy: np.ndarray,
+                                               cam: CameraParams,
+                                               img_h: int,
+                                               img_w: int,
+                                               min_y_margin: int = 4,
+                                               min_anchor_z: float = 0.5,
+                                               max_anchor_z: float = 200.0
+                                               ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    根据采样点的像素 y 坐标，使用相机高度和 pitch 估计稀疏 metric depth。
+
+    返回:
+        valid_points: [N, 2], 每个点为 (x, y)
+        z_geo: [N], 每个点对应的几何深度 Z，单位 meter
+        debug: dict
+    """
+    if points_xy is None or len(points_xy) == 0:
+        return (
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros((0,), dtype=np.float32),
+            {"num_points": 0, "reason": "no_input_points"}
+        )
+
+    H = float(cam.cam_height)
+    fy = float(cam.fy)
+    cy = float(cam.cy)
+    pitch = math.radians(float(cam.pitch_deg))
+
+    valid_points = []
+    z_list = []
+
+    for x, y in points_xy:
+        x = int(x)
+        y = int(y)
+
+        if x < 0 or x >= img_w or y < 0 or y >= img_h:
+            continue
+
+        if y < cy + min_y_margin:
+            continue
+
+        alpha = math.atan((float(y) - cy) / max(fy, 1e-6))
+        theta = pitch + alpha
+
+        if theta <= math.radians(0.5):
+            continue
+
+        z = H / math.tan(theta)
+
+        if not np.isfinite(z):
+            continue
+
+        if z <= 0.5 or z > 200.0:
+            continue
+
+        # 核心 anchor 过滤
+        if z < min_anchor_z or z > max_anchor_z:
+            continue
+
+        valid_points.append([x, y])
+        z_list.append(z)
+
+    if len(valid_points) == 0:
+        return (
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros((0,), dtype=np.float32),
+            {
+                "num_points": 0,
+                "reason": "no_valid_anchor_after_filter",
+                "min_anchor_z": float(min_anchor_z),
+                "max_anchor_z": float(max_anchor_z),
+                "pitch_deg": float(cam.pitch_deg),
+                "cam_height": float(cam.cam_height),
+            }
+        )
+
+    valid_points = np.array(valid_points, dtype=np.int32)
+    z_geo = np.array(z_list, dtype=np.float32)
+
+    return valid_points, z_geo, {
+        "num_points": int(len(valid_points)),
+        "min_z": float(np.min(z_geo)),
+        "med_z": float(np.median(z_geo)),
+        "max_z": float(np.max(z_geo)),
+        "min_anchor_z": float(min_anchor_z),
+        "max_anchor_z": float(max_anchor_z),
+        "pitch_deg": float(cam.pitch_deg),
+        "cam_height": float(cam.cam_height),
+    }
+
+
+def estimate_scale_candidate_from_geo_and_rel(points_xy: np.ndarray,
+                                              z_geo: np.ndarray,
+                                              depth_rel: np.ndarray,
+                                              min_points: int = 12,
+                                              max_rel: float = 1e9) -> Tuple[Optional[float], Dict[str, Any]]:
+    """
+    s_i = D_geo / D_rel
+    s_candidate = median(robust_filtered(s_i))
+    """
+    if len(points_xy) == 0 or len(z_geo) == 0:
+        return None, {"reason": "no_geo_points"}
+
+    h, w = depth_rel.shape[:2]
+    ratios = []
+
+    for (x, y), zg in zip(points_xy, z_geo):
+        if x < 0 or x >= w or y < 0 or y >= h:
+            continue
+        dr = float(depth_rel[y, x])
+        if not np.isfinite(dr):
+            continue
+        if dr <= 1e-6 or dr >= max_rel:
+            continue
+        ratios.append(zg / (dr + 1e-6))
+
+    if len(ratios) < min_points:
+        return None, {"reason": "too_few_ratio_points", "n": len(ratios)}
+
+    ratios = np.array(ratios, dtype=np.float32)
+    ratios_f = median_iqr_filter(ratios, k=1.5)
+
+    if len(ratios_f) < min_points:
+        return None, {"reason": "too_few_after_iqr", "n_raw": len(ratios), "n_filt": len(ratios_f)}
+
+    s = float(np.median(ratios_f))
+    return s, {
+        "n_raw": int(len(ratios)),
+        "n_filt": int(len(ratios_f)),
+        "ratio_med": float(np.median(ratios_f)),
+        "ratio_mean": float(np.mean(ratios_f)),
+        "ratio_std": float(np.std(ratios_f)),
+    }
+
+def estimate_scale_candidate_with_bands(points_xy: np.ndarray,
+                                        z_geo: np.ndarray,
+                                        depth_rel: np.ndarray,
+                                        point_weights: Optional[np.ndarray] = None,
+                                        min_points: int = 8,
+                                        max_rel: float = 1e9,
+                                        max_anchor_z: float = 30.0,
+                                        far_band_as_check_only: bool = True) -> Tuple[Optional[float], Dict[str, Any]]:
+    """
+    按真实几何距离 z_geo 动态划分近/中/远场 band
+    支持点权重（来自 hood prior / lane prior）
+    """
+    if len(points_xy) == 0 or len(z_geo) == 0:
+        return None, {"reason": "no_geo_points", "band_stats": []}
+
+    h, w = depth_rel.shape[:2]
+
+    if point_weights is None:
+        point_weights = np.ones((len(points_xy),), dtype=np.float32)
+    else:
+        point_weights = point_weights.astype(np.float32)
+
+    z_min = float(np.min(z_geo))
+    z_max = float(np.max(z_geo))
+    if z_max - z_min < 5.0:
+        return None, {"reason": "z_range_too_small", "band_stats": []}
+
+    q = np.percentile(z_geo, [0, 20, 40, 60, 80, 100])
+    z_bins = [float(x) for x in q]
+
+    band_stats = []
+    valid_band_scales = []
+    valid_band_weights = []
+
+    # 近场权重大，远场只做弱约束
+    base_weights = [0.50, 0.32, 0.14, 0.04, 0.00]
+
+    for i in range(len(z_bins) - 1):
+        band_id = i + 1
+        z_lo = z_bins[i]
+        z_hi = z_bins[i + 1]
+
+        if i < len(z_bins) - 2:
+            idx = np.where((z_geo >= z_lo) & (z_geo < z_hi))[0]
+        else:
+            idx = np.where((z_geo >= z_lo) & (z_geo <= z_hi))[0]
+
+        if len(idx) == 0:
+            band_stats.append({
+                "band_id": band_id,
+                "z_lo": z_lo,
+                "z_hi": z_hi,
+                "n_raw": 0,
+                "n_filt": 0,
+                "s_band": None,
+                "s_band_raw": None,
+                "used_weight": 0.0,
+                "status": "empty"
+            })
+            continue
+
+        ratios = []
+        weights = []
+
+        for j in idx:
+            x, y = points_xy[j]
+            if x < 0 or x >= w or y < 0 or y >= h:
+                continue
+
+            dr = float(depth_rel[y, x])
+            zg = float(z_geo[j])
+            wp = float(point_weights[j])
+
+            if not np.isfinite(dr) or not np.isfinite(zg):
+                continue
+            if dr <= 1e-6 or dr >= max_rel:
+                continue
+            if wp <= 1e-6:
+                continue
+
+            ratios.append(zg / (dr + 1e-6))
+            weights.append(wp)
+
+        if len(ratios) < min_points:
+            band_stats.append({
+                "band_id": band_id,
+                "z_lo": z_lo,
+                "z_hi": z_hi,
+                "n_raw": int(len(ratios)),
+                "n_filt": 0,
+                "s_band": None,
+                "s_band_raw": None,
+                "used_weight": 0.0,
+                "status": "too_few_raw"
+            })
+            continue
+
+        ratios = np.array(ratios, dtype=np.float32)
+        weights = np.array(weights, dtype=np.float32)
+
+        # 统一 IQR 掩码，ratios / weights 同步过滤
+        keep = iqr_keep_mask(ratios, k=1.5)
+        ratios_f = ratios[keep]
+        weights_f = weights[keep]
+
+        if len(ratios_f) < min_points:
+            band_stats.append({
+                "band_id": band_id,
+                "z_lo": z_lo,
+                "z_hi": z_hi,
+                "n_raw": int(len(ratios)),
+                "n_filt": int(len(ratios_f)),
+                "s_band": None,
+                "s_band_raw": None,
+                "used_weight": 0.0,
+                "status": "too_few_after_iqr"
+            })
+            continue
+
+        n_before_cap = int(len(ratios_f))
+        if band_id >= 4 and len(ratios_f) > 60:
+            pick_idx = np.linspace(0, len(ratios_f) - 1, 60).astype(np.int32)
+            ratios_f = ratios_f[pick_idx]
+            weights_f = weights_f[pick_idx]
+
+        # 原始 band 尺度：中位数
+        s_band_raw = float(np.median(ratios_f))
+
+        # 记录未归一化点权重统计，用于 band_support
+        raw_mean_weight = float(np.mean(weights_f))
+        raw_sum_weight = float(np.sum(weights_f))
+
+        # 归一化权重仅用于 band 内的加权尺度计算
+        weights_f = np.clip(weights_f, 1e-6, None)
+        weights_norm = weights_f / np.sum(weights_f)
+
+        s_band = float(np.sum(ratios_f * weights_norm))
+
+        # 远场尺度轻微压制，防止远场相对深度偏置抬高整体尺度
+        if band_id >= 3:
+            s_band *= 0.85
+
+        is_far_band = z_lo >= max_anchor_z or z_hi > max_anchor_z
+
+        if is_far_band and far_band_as_check_only:
+            band_stats.append({
+                "band_id": band_id,
+                "z_lo": z_lo,
+                "z_hi": z_hi,
+                "n_raw": int(len(ratios)),
+                "n_filt": int(len(ratios_f)),
+                "n_before_cap": n_before_cap,
+                "s_band": float(s_band),
+                "s_band_raw": float(s_band_raw),
+                "ratio_std": float(np.std(ratios_f)),
+                "mean_point_weight_raw": raw_mean_weight,
+                "sum_point_weight_raw": raw_sum_weight,
+                "used_weight": 0.0,
+                "status": "check_only_far_band"
+            })
+            continue
+
+
+        # band 级别权重：距离先验 × 原始点可信度 × 样本支持度
+        band_support = raw_mean_weight * len(ratios_f)
+        weight = float(base_weights[i] * band_support)
+
+        band_stats.append({
+            "band_id": band_id,
+            "z_lo": z_lo,
+            "z_hi": z_hi,
+            "n_raw": int(len(ratios)),
+            "n_filt": int(len(ratios_f)),
+            "n_before_cap": n_before_cap,
+            "s_band": float(s_band),
+            "s_band_raw": float(s_band_raw),
+            "ratio_std": float(np.std(ratios_f)),
+            "mean_point_weight_raw": raw_mean_weight,
+            "sum_point_weight_raw": raw_sum_weight,
+            "used_weight": weight,
+            "status": "valid"
+        })
+
+        valid_band_scales.append(float(s_band))
+        valid_band_weights.append(weight)
+
+    if len(valid_band_scales) < 2:
+        return None, {
+            "reason": "too_few_valid_bands",
+            "band_stats": band_stats
+        }
+
+    valid_band_scales = np.array(valid_band_scales, dtype=np.float32)
+    valid_band_weights = np.array(valid_band_weights, dtype=np.float32)
+    valid_band_weights = np.clip(valid_band_weights, 1e-6, None)
+    valid_band_weights = valid_band_weights / np.sum(valid_band_weights)
+
+    s_candidate = float(np.sum(valid_band_scales * valid_band_weights))
+
+    return s_candidate, {
+        "band_stats": band_stats,
+        "num_valid_bands": int(len(valid_band_scales)),
+        "fusion": "z_geo_dynamic_bands_weighted",
+        "band_weights": [float(x) for x in valid_band_weights],
+    }
+
+# =========================================================
+# confidence
+# 第一版：3 个分数
+# =========================================================
+
+def compute_lane_visibility_score(lane_mask: np.ndarray,
+                                  target_lane_pixels: int = 1500) -> Tuple[float, int]:
+    lane_mask = normalize_mask(lane_mask)
+    lane_pixels = int((lane_mask > 0).sum())
+    score = clip01(lane_pixels / float(max(target_lane_pixels, 1)))
+    return score, lane_pixels
+
+
+def compute_temporal_scale_stability_score(s_candidate: Optional[float],
+                                           s_prev: Optional[float],
+                                           k: float = 4.0) -> float:
+    if s_candidate is None:
+        return 0.0
+    if s_prev is None:
+        return 0.5
+    ratio = abs(s_candidate - s_prev) / max(abs(s_prev), 1e-6)
+    score = math.exp(-k * ratio)
+    return clip01(score)
+
+
+def compute_mask_visibility_score(road_mask: np.ndarray) -> Tuple[float, int]:
+    road_mask = normalize_mask(road_mask)
+    h, w = road_mask.shape[:2]
+    region = center_region_mask(h, w, x_ratio=0.5, width_ratio=0.45, y_ratio0=0.55)
+    denom = int(region.sum())
+    if denom <= 0:
+        return 0.0, int((road_mask > 0).sum())
+    hit = int(((road_mask > 0) & (region > 0)).sum())
+    ratio = hit / float(denom)
+    score = 0.5 + 0.5 * ratio
+    return clip01(score), int((road_mask > 0).sum())
+
+def compute_mask_visibility_score_with_prior(road_mask: np.ndarray,
+                                             hood_soft_mask: np.ndarray) -> Tuple[float, int]:
+    road_mask = normalize_mask(road_mask)
+    h, w = road_mask.shape[:2]
+    region = center_region_mask(h, w, x_ratio=0.5, width_ratio=0.45, y_ratio0=0.55)
+    road_valid = ((road_mask > 0).astype(np.float32) * (1.0 - hood_soft_mask))
+    valid = road_valid * (region > 0).astype(np.float32)
+    denom = float((region > 0).sum())
+    if denom <= 0:
+        return 0.0, int((road_mask > 0).sum())
+    ratio = float(valid.sum()) / max(denom, 1.0)
+    score = 0.5 + 0.5 * ratio
+    return clip01(score), int((road_mask > 0).sum())
+
+
+
+def fuse_confidence(score_lane_visibility: float,
+                    score_temporal_scale_stability: float,
+                    score_mask_visibility: float,
+                    score_hood_quality: float) -> float:
+    conf = (
+        0.18 * score_lane_visibility +
+        0.42 * score_temporal_scale_stability +
+        0.20 * score_mask_visibility +
+        0.20 * score_hood_quality
+    )
+    return clip01(conf)
+
+
+# =========================================================
+# 状态机
+# 第一版：INIT / TRACKING / HOLD
+# =========================================================
+
+def update_scale_state(state: ScaleState,
+                       s_candidate: Optional[float],
+                       confidence: float,
+                       args) -> Tuple[ScaleState, str]:
+    """
+    状态机：INIT / TRACKING / HOLD
+
+    update_action:
+        INIT_WAIT
+        INIT_LOCK
+        FAST
+        SLOW
+        FORCE_SLOW
+        JUMP_REJECT
+        FREEZE
+        HOLD
+    """
+
+    update_action = "HOLD"
+    jump_ratio = None
+
+    # =====================================================
+    # 0) 若已有稳定尺度，先计算 jump_ratio
+    # =====================================================
+    if state.s_final is not None and s_candidate is not None:
+        jump_ratio = abs(s_candidate - state.s_final) / max(abs(state.s_final), 1e-6)
+
+    # =====================================================
+    # 1) INIT 阶段：不要过度使用 jump gate
+    # =====================================================
+    if state.mode == "INIT":
+        if s_candidate is not None and confidence >= args.conf_high:
+            state.good_count += 1
+
+            if state.good_count >= args.init_good_frames:
+                state.s_final = s_candidate
+                state.last_good_s = s_candidate
+                state.mode = "TRACKING"
+                state.good_count = 0
+                state.hold_count = 0
+                update_action = "INIT_LOCK"
+            else:
+                update_action = "INIT_WAIT"
+        else:
+            state.good_count = 0
+            update_action = "INIT_WAIT"
+
+        state.history.append({
+            "s_candidate": s_candidate,
+            "s_final": state.s_final,
+            "confidence": confidence,
+            "jump_ratio": jump_ratio,
+            "mode": state.mode,
+            "update_action": update_action
+        })
+        return state, update_action
+
+    # =====================================================
+    # 2) 若当前没有候选，进入/保持 HOLD
+    # =====================================================
+    if s_candidate is None:
+        if state.mode == "TRACKING":
+            state.mode = "HOLD"
+            state.hold_count = 1
+            update_action = "FREEZE"
+        else:
+            state.hold_count += 1
+            update_action = "HOLD"
+
+        state.history.append({
+            "s_candidate": s_candidate,
+            "s_final": state.s_final,
+            "confidence": confidence,
+            "jump_ratio": jump_ratio,
+            "mode": state.mode,
+            "update_action": update_action
+        })
+        return state, update_action
+
+    # =====================================================
+    # 3) jump gate：核心改动
+    # =====================================================
+    force_alpha = None
+    force_action = None
+
+    if jump_ratio is not None:
+        # 3.1 大跳变：直接冻结，不让污染进入 state
+        if jump_ratio > args.jump_freeze_ratio:
+            state.mode = "HOLD"
+            state.hold_count += 1
+            update_action = "FREEZE"
+
+            state.history.append({
+                "s_candidate": s_candidate,
+                "s_final": state.s_final,
+                "confidence": confidence,
+                "jump_ratio": jump_ratio,
+                "mode": state.mode,
+                "update_action": update_action
+            })
+            return state, update_action
+
+        # 3.2 明显跳变：不 FAST，只允许极慢更新
+        elif jump_ratio > args.jump_reject_ratio:
+            force_alpha = args.alpha_jump
+            force_action = "JUMP_REJECT"
+
+        # 3.3 中等跳变：强制慢更新
+        elif jump_ratio > args.jump_slow_ratio:
+            force_alpha = args.alpha_slow
+            force_action = "FORCE_SLOW"
+
+    # =====================================================
+    # 4) TRACKING 阶段
+    # =====================================================
+    if state.mode == "TRACKING":
+
+        if confidence < args.conf_mid:
+            state.mode = "HOLD"
+            state.hold_count = 1
+            update_action = "FREEZE"
+
+        else:
+            # jump gate 优先级高于 confidence
+            if force_alpha is not None:
+                state.s_final = blend(state.s_final, s_candidate, force_alpha)
+                state.last_good_s = state.s_final
+                state.hold_count = 0
+                update_action = force_action
+
+            elif confidence >= args.conf_high:
+                state.s_final = blend(state.s_final, s_candidate, args.alpha_fast)
+                state.last_good_s = state.s_final
+                state.hold_count = 0
+                update_action = "FAST"
+
+            else:
+                state.s_final = blend(state.s_final, s_candidate, args.alpha_slow)
+                state.last_good_s = state.s_final
+                state.hold_count = 0
+                update_action = "SLOW"
+
+    # =====================================================
+    # 5) HOLD 阶段
+    # =====================================================
+    elif state.mode == "HOLD":
+
+        if confidence >= args.conf_high:
+            state.mode = "TRACKING"
+
+            # HOLD 恢复时也不要 FAST
+            if force_alpha is not None:
+                state.s_final = blend(state.s_final, s_candidate, force_alpha)
+                update_action = force_action
+            else:
+                state.s_final = blend(state.s_final, s_candidate, args.alpha_slow)
+                update_action = "SLOW"
+
+            state.last_good_s = state.s_final
+            state.hold_count = 0
+
+        elif confidence >= args.conf_mid and force_alpha is not None:
+            # 中等置信度但 jump 可控：允许极慢靠近
+            state.s_final = blend(state.s_final, s_candidate, force_alpha)
+            state.last_good_s = state.s_final
+            state.hold_count += 1
+            update_action = force_action
+
+        else:
+            state.hold_count += 1
+            update_action = "HOLD"
+
+    # =====================================================
+    # 6) 记录历史
+    # =====================================================
+    state.history.append({
+        "s_candidate": s_candidate,
+        "s_final": state.s_final,
+        "confidence": confidence,
+        "jump_ratio": jump_ratio,
+        "mode": state.mode,
+        "update_action": update_action
+    })
+
+    return state, update_action
+
+
+# =========================================================
+# 可视化
+# =========================================================
+
+def overlay_masks(bgr: np.ndarray, lane_mask: np.ndarray, road_mask: np.ndarray,
+                  alpha_road: float = 0.40, alpha_lane: float = 0.75) -> np.ndarray:
+    out = bgr.copy()
+    lane_mask = normalize_mask(lane_mask)
+    road_mask = normalize_mask(road_mask)
+
+    road_bool = road_mask > 0
+    lane_bool = lane_mask > 0
+
+    if road_bool.any():
+        green = np.zeros_like(out)
+        green[..., 1] = 255
+        out = np.where(road_bool[..., None], (out * (1 - alpha_road) + green * alpha_road).astype(np.uint8), out)
+
+    if lane_bool.any():
+        red = np.zeros_like(out)
+        red[..., 2] = 255
+        out = np.where(lane_bool[..., None], (out * (1 - alpha_lane) + red * alpha_lane).astype(np.uint8), out)
+
+    return out
+
+def overlay_hood_mask(bgr: np.ndarray,
+                      hood_mask: np.ndarray,
+                      hood_debug: Optional[Dict[str, Any]] = None,
+                      alpha: float = 0.35) -> np.ndarray:
+    out = bgr.copy()
+    hood_bool = hood_mask.astype(bool)
+
+    if hood_bool.any():
+        gray = np.zeros_like(out)
+        gray[:] = (80, 80, 80)
+        out = np.where(
+            hood_bool[..., None],
+            (out * (1 - alpha) + gray * alpha).astype(np.uint8),
+            out
+        )
+
+    if hood_debug is not None and "hood_top_curve" in hood_debug:
+        curve = hood_debug["hood_top_curve"]
+        pts = np.array([[x, int(curve[x])] for x in range(len(curve))], dtype=np.int32)
+
+        # 白色粗底线
+        cv2.polylines(out, [pts], isClosed=False, color=(255, 255, 255), thickness=4)
+        # 黄色细线
+        cv2.polylines(out, [pts], isClosed=False, color=(0, 255, 255), thickness=2)
+
+    else:
+        contours, _ = cv2.findContours(
+            (hood_mask > 0).astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        if len(contours) > 0:
+            cv2.drawContours(out, contours, -1, (255, 255, 255), 4)
+            cv2.drawContours(out, contours, -1, (0, 255, 255), 2)
+
+    return out
+
+
+def draw_sample_points(img: np.ndarray, points_xy: np.ndarray, color=(255, 255, 0)) -> np.ndarray:
+    out = img.copy()
+    for x, y in points_xy:
+        cv2.circle(out, (int(x), int(y)), 2, color, -1, cv2.LINE_AA)
+    return out
+
+
+def make_panel(frame_bgr: np.ndarray,
+               overlay_bgr: np.ndarray,
+               depth_vis: np.ndarray,
+               panel_w: int = None) -> np.ndarray:
+    """
+    生成 3 拼图：
+    原图 | overlay | depth
+    """
+    h, w = frame_bgr.shape[:2]
+    if panel_w is None:
+        panel_w = w
+
+    img0 = cv2.resize(frame_bgr, (panel_w, h))
+    img1 = cv2.resize(overlay_bgr, (panel_w, h))
+    img2 = cv2.resize(depth_vis, (panel_w, h))
+    return np.concatenate([img0, img1, img2], axis=1)
+
+
+# =========================================================
+# CSV
+# =========================================================
+
+def init_csv(csv_path: str):
+    ensure_dir(os.path.dirname(csv_path))
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame_id",
+            "mode",
+            "update_action",
+            "s_candidate",
+            "s_final",
+            "confidence",
+            "lane_pixels",
+            "road_pixels",
+            "score_lane_visibility",
+            "score_temporal_scale_stability",
+            "score_mask_visibility",
+            "hood_conf",
+            "hood_reused",
+            "hood_reuse_age",
+            "hood_locked",
+            "geo_points_num",
+            "sample_points_num",
+            "z_min",
+            "z_med",
+            "z_max",
+            "mean_point_weight",
+            "fit_reason",
+            "ratio_points_raw",
+            "ratio_points_filt"
+        ])
+
+
+def append_csv(csv_path: str, state: ScaleState, ev: FrameEvidence):
+    fit_debug = ev.debug.get("fit_debug", {})
+    geo_debug = ev.debug.get("geo_debug", {})
+    hood_conf = ev.debug.get("hood_conf", 0.0)
+    hood_debug = ev.debug.get("hood_debug", {})
+
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            ev.frame_id,
+            state.mode,
+            ev.update_action,
+            "" if ev.s_candidate is None else f"{ev.s_candidate:.6f}",
+            "" if state.s_final is None else f"{state.s_final:.6f}",
+            f"{ev.confidence:.6f}",
+            ev.lane_pixels,
+            ev.road_pixels,
+            f"{ev.score_lane_visibility:.6f}",
+            f"{ev.score_temporal_scale_stability:.6f}",
+            f"{ev.score_mask_visibility:.6f}",
+            f"{hood_conf:.6f}",
+            int(bool(hood_debug.get("hood_reused", hood_debug.get("reused", False)))),
+            int(hood_debug.get("hood_reuse_age", hood_debug.get("reuse_age", 0))),
+            int(bool(hood_debug.get("hood_locked", False))),
+            geo_debug.get("num_points", 0),
+            ev.debug.get("sample_points_num", 0),
+            "" if geo_debug.get("z_min", None) is None else f"{geo_debug.get('z_min'):.6f}",
+            "" if geo_debug.get("z_med", None) is None else f"{geo_debug.get('z_med'):.6f}",
+            "" if geo_debug.get("z_max", None) is None else f"{geo_debug.get('z_max'):.6f}",
+            f"{geo_debug.get('mean_point_weight', 0.0):.6f}",
+            fit_debug.get("reason", "ok"),
+            fit_debug.get("n_raw", 0),
+            fit_debug.get("n_filt", 0),
+        ])
+
+
+RUNTIME_COLUMNS = [
+    "frame_id",
+    "mode",
+    "update_action",
+    "s_candidate",
+    "s_final",
+    "confidence",
+    "read_resize_time_ms",
+    "undistort_time_ms",
+    "segmentation_time_ms",
+    "depth_time_ms",
+    "detection_time_ms",
+    "mask_postprocess_time_ms",
+    "hood_time_ms",
+    "hood_reused",
+    "hood_reuse_age",
+    "hood_locked",
+    "support_sampling_time_ms",
+    "geometry_anchor_time_ms",
+    "scale_candidate_time_ms",
+    "confidence_state_time_ms",
+    "visualization_time_ms",
+    "process_total_time_ms",
+    "video_write_time_ms",
+    "csv_write_time_ms",
+    "frame_total_time_ms",
+    "inference_core_time_ms",
+    "inference_core_fps",
+    "full_total_fps",
+    "lane_pixels",
+    "road_pixels",
+    "geo_points_num",
+    "sample_points_num",
+    "ratio_points_raw",
+    "ratio_points_filt",
+]
+
+
+def init_runtime_csv(csv_path: str):
+    ensure_dir(os.path.dirname(csv_path))
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RUNTIME_COLUMNS)
+        writer.writeheader()
+
+
+def build_runtime_row(frame_id: int,
+                      runtime: Dict[str, float],
+                      state: ScaleState,
+                      ev: FrameEvidence) -> Dict[str, Any]:
+    fit_debug = ev.debug.get("fit_debug", {})
+    geo_debug = ev.debug.get("geo_debug", {})
+
+    read_resize_ms = float(runtime.get("read_resize_time_ms", 0.0))
+    process_ms = float(runtime.get("process_total_time_ms", 0.0))
+    video_write_ms = float(runtime.get("video_write_time_ms", 0.0))
+    csv_write_ms = float(runtime.get("csv_write_time_ms", 0.0))
+    frame_total_ms = read_resize_ms + process_ms + video_write_ms + csv_write_ms
+    core_ms = float(runtime.get("inference_core_time_ms", 0.0))
+
+    row = {
+        "frame_id": int(frame_id),
+        "mode": state.mode,
+        "update_action": ev.update_action,
+        "s_candidate": "" if ev.s_candidate is None else f"{ev.s_candidate:.6f}",
+        "s_final": "" if state.s_final is None else f"{state.s_final:.6f}",
+        "confidence": f"{ev.confidence:.6f}",
+        "read_resize_time_ms": f"{read_resize_ms:.6f}",
+        "undistort_time_ms": f"{runtime.get('undistort_time_ms', 0.0):.6f}",
+        "segmentation_time_ms": f"{runtime.get('segmentation_time_ms', 0.0):.6f}",
+        "depth_time_ms": f"{runtime.get('depth_time_ms', 0.0):.6f}",
+        "detection_time_ms": f"{runtime.get('detection_time_ms', 0.0):.6f}",
+        "mask_postprocess_time_ms": f"{runtime.get('mask_postprocess_time_ms', 0.0):.6f}",
+        "hood_time_ms": f"{runtime.get('hood_time_ms', 0.0):.6f}",
+        "hood_reused": int(runtime.get("hood_reused", 0)),
+        "hood_reuse_age": int(runtime.get("hood_reuse_age", -1)),
+        "hood_locked": int(runtime.get("hood_locked", 0)),
+        "support_sampling_time_ms": f"{runtime.get('support_sampling_time_ms', 0.0):.6f}",
+        "geometry_anchor_time_ms": f"{runtime.get('geometry_anchor_time_ms', 0.0):.6f}",
+        "scale_candidate_time_ms": f"{runtime.get('scale_candidate_time_ms', 0.0):.6f}",
+        "confidence_state_time_ms": f"{runtime.get('confidence_state_time_ms', 0.0):.6f}",
+        "visualization_time_ms": f"{runtime.get('visualization_time_ms', 0.0):.6f}",
+        "process_total_time_ms": f"{process_ms:.6f}",
+        "video_write_time_ms": f"{video_write_ms:.6f}",
+        "csv_write_time_ms": f"{csv_write_ms:.6f}",
+        "frame_total_time_ms": f"{frame_total_ms:.6f}",
+        "inference_core_time_ms": f"{core_ms:.6f}",
+        "inference_core_fps": f"{fps_from_ms(core_ms):.6f}",
+        "full_total_fps": f"{fps_from_ms(frame_total_ms):.6f}",
+        "lane_pixels": int(ev.lane_pixels),
+        "road_pixels": int(ev.road_pixels),
+        "geo_points_num": int(geo_debug.get("num_points", 0)),
+        "sample_points_num": int(ev.debug.get("sample_points_num", 0)),
+        "ratio_points_raw": int(fit_debug.get("n_raw", fit_debug.get("n", 0))),
+        "ratio_points_filt": int(fit_debug.get("n_filt", 0)),
+    }
+    return row
+
+
+def append_runtime_csv(csv_path: str, row: Dict[str, Any]):
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RUNTIME_COLUMNS)
+        writer.writerow(row)
+
+
+def save_runtime_summary(summary_path: str, runtime_rows: List[Dict[str, Any]]):
+    ensure_dir(os.path.dirname(summary_path))
+
+    if len(runtime_rows) == 0:
+        with open(summary_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value"])
+            writer.writerow(["num_frames", 0])
+        return
+
+    numeric_cols = [
+        "read_resize_time_ms",
+        "undistort_time_ms",
+        "segmentation_time_ms",
+        "depth_time_ms",
+        "detection_time_ms",
+        "mask_postprocess_time_ms",
+        "hood_time_ms",
+        "support_sampling_time_ms",
+        "geometry_anchor_time_ms",
+        "scale_candidate_time_ms",
+        "confidence_state_time_ms",
+        "visualization_time_ms",
+        "process_total_time_ms",
+        "video_write_time_ms",
+        "csv_write_time_ms",
+        "frame_total_time_ms",
+        "inference_core_time_ms",
+    ]
+
+    values = {}
+    for col in numeric_cols:
+        arr = np.array([float(r[col]) for r in runtime_rows], dtype=np.float64)
+        values[f"{col}_mean"] = float(np.mean(arr))
+        values[f"{col}_median"] = float(np.median(arr))
+        values[f"{col}_p95"] = float(np.percentile(arr, 95))
+
+    core_mean_ms = values["inference_core_time_ms_mean"]
+    full_mean_ms = values["frame_total_time_ms_mean"]
+
+    summary_row = {
+        "num_frames": int(len(runtime_rows)),
+        "inference_core_fps_from_mean_ms": fps_from_ms(core_mean_ms),
+        "full_total_fps_from_mean_ms": fps_from_ms(full_mean_ms),
+        **values,
+    }
+
+    with open(summary_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+        writer.writeheader()
+        writer.writerow(summary_row)
+
+
+# =========================================================
+# 主流程
+# =========================================================
+
+
+def process_one_frame(frame_id: int,
+                      bgr: np.ndarray,
+                      cam: CameraParams,
+                      seg_runner: SegmentationRunner,
+                      depth_runner: DepthRunner,
+                      det_runner: DetectionRunner,
+                      scale_state: ScaleState,
+                      hood_state: HoodState,
+                      args) -> Tuple[np.ndarray, FrameEvidence, ScaleState, HoodState, Dict[str, float]]:
+    runtime = {}
+    t_process_start = now_ms()
+
+    t0 = now_ms()
+    if args.undistort:
+        bgr_in = undistort_if_possible(bgr, cam)
+    else:
+        bgr_in = bgr
+    runtime["undistort_time_ms"] = now_ms() - t0
+
+    cuda_sync_if_needed(args)
+    t0 = now_ms()
+    lane_mask, road_mask, seg_debug = seg_runner(bgr_in)
+    cuda_sync_if_needed(args)
+    runtime["segmentation_time_ms"] = now_ms() - t0
+
+    cuda_sync_if_needed(args)
+    t0 = now_ms()
+    depth_rel, depth_debug = depth_runner(bgr_in)
+    cuda_sync_if_needed(args)
+    runtime["depth_time_ms"] = now_ms() - t0
+
+    cuda_sync_if_needed(args)
+    t0 = now_ms()
+    detections = det_runner(bgr_in) if args.enable_det else []
+    cuda_sync_if_needed(args)
+    runtime["detection_time_ms"] = now_ms() - t0
+
+    t0 = now_ms()
+    lane_mask = normalize_mask(lane_mask)
+    road_mask = normalize_mask(road_mask)
+    runtime["mask_postprocess_time_ms"] = now_ms() - t0
+
+    t0 = now_ms()
+    hood_soft_mask, hood_hard_mask, hood_conf, hood_debug, hood_state = get_or_update_hood_prior(
+        frame_id=frame_id,
+        depth_rel=depth_rel,
+        road_mask=road_mask,
+        hood_state=hood_state,
+        args=args,
+    )
+    runtime["hood_time_ms"] = now_ms() - t0
+    runtime["hood_reused"] = 1 if bool(hood_debug.get("hood_reused", hood_debug.get("reused", False))) else 0
+    runtime["hood_reuse_age"] = int(hood_debug.get("hood_reuse_age", hood_debug.get("reuse_age", 0)))
+    runtime["hood_locked"] = 1 if bool(hood_debug.get("hood_locked", False)) else 0
+
+    if frame_id % 30 == 0:
+        print("[hood]",
+              "reason=", hood_debug.get("reason"),
+              "source=", hood_debug.get("boundary_source"),
+              "reused=", hood_debug.get("hood_reused", hood_debug.get("reused", False)),
+              "locked=", hood_debug.get("hood_locked", False),
+              "age=", hood_debug.get("hood_reuse_age", hood_debug.get("reuse_age", 0)),
+              "candidate_area=", hood_debug.get("candidate_area"),
+              "x_span_ratio=", hood_debug.get("x_span_ratio"),
+              "aspect_ratio=", hood_debug.get("aspect_ratio"),
+              "bottom_touch_ratio=", hood_debug.get("bottom_touch_ratio"),
+              "near_mode=", hood_debug.get("near_mode"),
+              "curve_min_y=", hood_debug.get("curve_min_y"),
+              "curve_max_y=", hood_debug.get("curve_max_y"),
+              "hood_conf=", f"{hood_conf:.3f}")
+
+    t0 = now_ms()
+    sample_pts, point_weights, support_debug = extract_support_region_points_with_hood_prior(
+        road_mask=road_mask,
+        lane_mask=lane_mask,
+        hood_soft_mask=hood_soft_mask,
+        y_ratio0=args.support_y_ratio0,
+        center_width_ratio=args.support_center_width_ratio,
+        sample_step_y=args.sample_step_y,
+        sample_step_x=args.support_sample_step_x,
+        min_row_width=args.support_min_row_width,
+        hood_penalty_lambda=args.hood_penalty_lambda,
+        min_point_weight=args.min_point_weight,
+        lane_center_sigma_px=args.lane_center_sigma_px,
+        lane_weight_alpha=args.lane_weight_alpha,
+    )
+    runtime["support_sampling_time_ms"] = now_ms() - t0
+
+    t0 = now_ms()
+    valid_points, valid_z, valid_weights = [], [], []
+    if len(sample_pts) > 0:
+        H = cam.cam_height
+        fy, cy = cam.fy, cam.cy
+        pitch = math.radians(cam.pitch_deg)
+        for idx, (x, y) in enumerate(sample_pts):
+            if y < cy + 4:
+                continue
+            alpha = math.atan((float(y) - cy) / max(fy, 1e-6))
+            theta = pitch + alpha
+            if theta <= math.radians(0.5):
+                continue
+            z = H / math.tan(theta)
+
+            if not np.isfinite(z):
+                continue
+
+            if z <= 0.5 or z > 200.0:
+                continue
+
+            if z < args.scale_min_anchor_z or z > args.scale_max_anchor_z:
+                continue
+
+            valid_points.append([x, y])
+            valid_z.append(z)
+            valid_weights.append(float(point_weights[idx]))
+    valid_points = np.array(valid_points, dtype=np.int32) if valid_points else np.zeros((0,2),dtype=np.int32)
+    valid_z = np.array(valid_z, dtype=np.float32) if valid_z else np.zeros((0,),dtype=np.float32)
+    valid_weights = np.array(valid_weights, dtype=np.float32) if valid_weights else np.zeros((0,),dtype=np.float32)
+
+    geo_debug = {
+        "num_points": int(len(valid_points)),
+        "pitch_deg": cam.pitch_deg,
+        "cam_height": cam.cam_height,
+        "mean_point_weight": float(np.mean(valid_weights)) if len(valid_weights) > 0 else 0.0,
+        "z_min": float(np.min(valid_z)) if len(valid_z) > 0 else None,
+        "z_med": float(np.median(valid_z)) if len(valid_z) > 0 else None,
+        "z_max": float(np.max(valid_z)) if len(valid_z) > 0 else None,
+    }
+    if len(valid_z) > 0 and frame_id % 30 == 0:
+        print(
+            f"[anchor-filter] frame={frame_id} "
+            f"min={float(np.min(valid_z)):.2f} "
+            f"med={float(np.median(valid_z)):.2f} "
+            f"max={float(np.max(valid_z)):.2f} "
+            f"n={len(valid_z)}"
+        )
+    runtime["geometry_anchor_time_ms"] = now_ms() - t0
+
+    t0 = now_ms()
+    s_candidate, fit_debug = estimate_scale_candidate_from_geo_and_rel(
+        points_xy=valid_points,
+        z_geo=valid_z,
+        depth_rel=depth_rel,
+        min_points=args.min_scale_points
+    )
+    runtime["scale_candidate_time_ms"] = now_ms() - t0
+
+    t0 = now_ms()
+    score_lane_visibility, lane_pixels = compute_lane_visibility_score(lane_mask, target_lane_pixels=args.target_lane_pixels)
+    score_temporal_scale_stability = compute_temporal_scale_stability_score(
+        s_candidate=s_candidate, s_prev=scale_state.s_final, k=args.scale_stability_k
+    )
+    score_mask_visibility, road_pixels = compute_mask_visibility_score_with_prior(road_mask, hood_soft_mask)
+    confidence = fuse_confidence(score_lane_visibility, score_temporal_scale_stability, score_mask_visibility, hood_conf)
+    scale_state, update_action = update_scale_state(scale_state, s_candidate, confidence, args)
+    runtime["confidence_state_time_ms"] = now_ms() - t0
+
+    ev = FrameEvidence(
+        frame_id=frame_id, s_candidate=s_candidate, lane_pixels=lane_pixels, road_pixels=road_pixels,
+        score_lane_visibility=score_lane_visibility, score_temporal_scale_stability=score_temporal_scale_stability,
+        score_mask_visibility=score_mask_visibility, confidence=confidence, update_action=update_action,
+        debug={"seg_debug": seg_debug, "depth_debug": depth_debug, "geo_debug": geo_debug, "fit_debug": fit_debug,
+               "hood_debug": hood_debug, "hood_conf": hood_conf, "support_debug": support_debug, "detections": detections,
+               "sample_points_num": int(len(sample_pts)), "valid_geo_points_num": int(len(valid_points))}
+    )
+
+    panel = None
+    if getattr(args, "no_vis", False):
+        runtime["visualization_time_ms"] = 0.0
+    else:
+        t0 = now_ms()
+        overlay = overlay_masks(bgr_in, lane_mask, road_mask)
+        overlay = overlay_hood_mask(overlay, hood_hard_mask, hood_debug=hood_debug, alpha=0.5)
+        overlay = draw_sample_points(overlay, valid_points, color=(255, 255, 0))
+        depth_abs = depth_rel * float(scale_state.s_final) if scale_state.s_final is not None else None
+        depth_vis = colorize_depth(depth_abs if depth_abs is not None else depth_rel)
+        panel = make_panel(bgr_in, overlay, depth_vis, panel_w=bgr_in.shape[1])
+
+        last_hist = scale_state.history[-1] if len(scale_state.history) > 0 else {}
+        jump_val = last_hist.get("jump_ratio", None)
+
+        lines = [
+            f"frame: {frame_id}",
+            f"mode: {scale_state.mode}",
+            f"update: {update_action}",
+            f"s_candidate: {'None' if s_candidate is None else f'{s_candidate:.3f}'}",
+            f"s_final: {'None' if scale_state.s_final is None else f'{scale_state.s_final:.3f}'}",
+            f"conf: {confidence:.3f}",
+            f"jump: {'None' if jump_val is None else f'{jump_val:.3f}'}",
+            f"hood_conf: {hood_conf:.3f}",
+            f"hood_src: {hood_debug.get('boundary_source', 'unknown')}",
+            f"hood_reuse: {int(bool(hood_debug.get('hood_reused', hood_debug.get('reused', False))))} age={hood_debug.get('hood_reuse_age', hood_debug.get('reuse_age', 0))}",
+            f"hood_lock: {int(bool(hood_debug.get('hood_locked', False)))}",
+            f"lane_vis: {score_lane_visibility:.3f}",
+            f"scale_stab: {score_temporal_scale_stability:.3f}",
+            f"mask_vis: {score_mask_visibility:.3f}",
+            f"geo_pts: {ev.debug.get('valid_geo_points_num', 0)}",
+            f"pt_w_mean: {geo_debug.get('mean_point_weight', 0.0):.3f}",
+        ]
+
+        for bs in fit_debug.get("band_stats", []):
+            n = bs.get("n_filt", 0)
+            s_band = bs.get("s_band", None)
+            z_lo = bs.get("z_lo", 0.0)
+            z_hi = bs.get("z_hi", 0.0)
+            status = bs.get("status", "")
+
+            if s_band is None:
+                lines.append(f"{z_lo:.1f}-{z_hi:.1f}m: n={n}, invalid")
+            else:
+                tag = " CHECK" if status == "check_only_far_band" else ""
+                lines.append(f"{z_lo:.1f}-{z_hi:.1f}m: n={n}, s={s_band:.2f}{tag}")
+
+        panel = draw_text_block(panel, lines, x=20, y=32, line_h=26, font_scale=0.70)
+        runtime["visualization_time_ms"] = now_ms() - t0
+
+    runtime["inference_core_time_ms"] = (
+        runtime.get("segmentation_time_ms", 0.0) +
+        runtime.get("depth_time_ms", 0.0) +
+        runtime.get("detection_time_ms", 0.0) +
+        runtime.get("hood_time_ms", 0.0) +
+        runtime.get("support_sampling_time_ms", 0.0) +
+        runtime.get("geometry_anchor_time_ms", 0.0) +
+        runtime.get("scale_candidate_time_ms", 0.0) +
+        runtime.get("confidence_state_time_ms", 0.0)
+    )
+    runtime["process_total_time_ms"] = now_ms() - t_process_start
+
+    return panel, ev, scale_state, hood_state, runtime
+
+
+
+def run_video(args):
+    print("ROOT   :", os.getcwd())
+    print("Video  :", args.video)
+    print("Camera :", args.cam_yaml)
+    print("Output :", args.out_dir)
+
+    ensure_dir(args.out_dir)
+    vis_dir = os.path.join(args.out_dir, "vis")
+    ensure_dir(vis_dir)
+
+    csv_path = os.path.join(args.out_dir, "scale_debug.csv")
+    init_csv(csv_path)
+
+    runtime_csv_path = os.path.join(args.out_dir, "runtime_per_frame.csv")
+    runtime_summary_path = os.path.join(args.out_dir, "runtime_summary.csv")
+    init_runtime_csv(runtime_csv_path)
+    runtime_rows = []
+
+    # 1) 先读取原始标定内参
+    cam = load_camera_params(args.cam_yaml)
+
+    # 2) 打开视频
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {args.video}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 1e-6:
+        fps = 25.0
+
+    # 3) 读取第一帧，用于确定原始尺寸和处理尺寸
+    ok, frame0 = cap.read()
+    if not ok:
+        raise RuntimeError("Cannot read first frame from video.")
+
+    orig_h, orig_w = frame0.shape[:2]
+
+    if args.resize_w > 0:
+        frame0 = resize_if_needed(frame0, width=args.resize_w)
+
+    new_h, new_w = frame0.shape[:2]
+
+    # 4) 如果 resize 了图像，必须同步缩放内参
+    if (new_w != orig_w) or (new_h != orig_h):
+        cam = scale_camera_params(cam, orig_w, orig_h, new_w, new_h)
+
+    print(f"[Frame] original size   = {orig_w}x{orig_h}")
+    print(f"[Frame] processing size = {new_w}x{new_h}")
+    print(f"[Camera] fx={cam.fx:.2f}, fy={cam.fy:.2f}, cx={cam.cx:.2f}, cy={cam.cy:.2f}")
+    print(f"[Camera] H={cam.cam_height:.3f} m, pitch={cam.pitch_deg:.3f} deg, roll={cam.roll_deg:.3f} deg, yaw={cam.yaw_deg:.3f} deg")
+
+    # 5) 初始化模型 runner
+    seg_runner = build_segmentation_runner(args)
+    depth_runner = build_depth_runner(args)
+    det_runner = build_detection_runner(args)
+
+    # 6) 初始化输出视频；--no-vis 时不生成可视化视频
+    panel_w = new_w * 3
+    panel_h = new_h
+
+    writer = None
+    vis_video_path = os.path.join(vis_dir, "video_scale_stable_vis.mp4")
+
+    if getattr(args, "no_vis", False):
+        print("[Vis] Disabled by --no-vis. Only CSV/runtime files will be saved.")
+        if args.show:
+            print("[Vis] --show is ignored because --no-vis is enabled.")
+            args.show = False
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(vis_video_path, fourcc, fps, (panel_w, panel_h))
+
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot open writer: {vis_video_path}")
+
+    # 7) 初始化状态
+    scale_state = ScaleState()
+    hood_state = HoodState()
+
+    frame_id = 0
+    t0 = time.time()
+
+    print(f"[Scale Anchor] min_z={args.scale_min_anchor_z}, max_z={args.scale_max_anchor_z}")
+
+    # 8) 先处理第一帧
+    frame_runtime_start = now_ms()
+    panel, ev, scale_state, hood_state, runtime = process_one_frame(
+        frame_id=frame_id,
+        bgr=frame0,
+        cam=cam,
+        seg_runner=seg_runner,
+        depth_runner=depth_runner,
+        det_runner=det_runner,
+        scale_state=scale_state,
+        hood_state=hood_state,
+        args=args
+    )
+    runtime["read_resize_time_ms"] = 0.0
+
+    t_write = now_ms()
+    if writer is not None and panel is not None:
+        writer.write(panel)
+    runtime["video_write_time_ms"] = now_ms() - t_write
+
+    t_csv = now_ms()
+    append_csv(csv_path, scale_state, ev)
+    runtime["csv_write_time_ms"] = now_ms() - t_csv
+
+    runtime_row = build_runtime_row(frame_id, runtime, scale_state, ev)
+    runtime_rows.append(runtime_row)
+    append_runtime_csv(runtime_csv_path, runtime_row)
+    frame_id += 1
+
+    # 9) 循环处理后续帧
+    while True:
+        t_read = now_ms()
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        if args.resize_w > 0:
+            frame = resize_if_needed(frame, width=args.resize_w)
+        read_resize_time_ms = now_ms() - t_read
+
+        panel, ev, scale_state, hood_state, runtime = process_one_frame(
+            frame_id=frame_id,
+            bgr=frame,
+            cam=cam,
+            seg_runner=seg_runner,
+            depth_runner=depth_runner,
+            det_runner=det_runner,
+            scale_state=scale_state,
+            hood_state=hood_state,
+            args=args
+        )
+        runtime["read_resize_time_ms"] = read_resize_time_ms
+
+        t_write = now_ms()
+        if writer is not None and panel is not None:
+            writer.write(panel)
+        runtime["video_write_time_ms"] = now_ms() - t_write
+
+        t_csv = now_ms()
+        append_csv(csv_path, scale_state, ev)
+        runtime["csv_write_time_ms"] = now_ms() - t_csv
+
+        runtime_row = build_runtime_row(frame_id, runtime, scale_state, ev)
+        runtime_rows.append(runtime_row)
+        append_runtime_csv(runtime_csv_path, runtime_row)
+
+        if args.show and panel is not None:
+            cv2.imshow("video_scale_stable", panel)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                break
+
+        if frame_id % 20 == 0:
+            elapsed = time.time() - t0
+            core_ms = float(runtime_row["inference_core_time_ms"])
+            full_ms = float(runtime_row["frame_total_time_ms"])
+            print(
+                f"[{frame_id}] mode={scale_state.mode} "
+                f"s_final={scale_state.s_final} "
+                f"core_fps={fps_from_ms(core_ms):.2f} "
+                f"full_fps={fps_from_ms(full_ms):.2f} "
+                f"elapsed={elapsed:.1f}s"
+            )
+
+        frame_id += 1
+
+    # 10) 释放资源
+    cap.release()
+    if writer is not None:
+        writer.release()
+
+    if args.show:
+        cv2.destroyAllWindows()
+
+    elapsed = time.time() - t0
+    save_runtime_summary(runtime_summary_path, runtime_rows)
+
+    overall_wall_fps = frame_id / elapsed if elapsed > 1e-9 else 0.0
+    if len(runtime_rows) > 0:
+        core_mean_ms = float(np.mean([float(r["inference_core_time_ms"]) for r in runtime_rows]))
+        full_mean_ms = float(np.mean([float(r["frame_total_time_ms"]) for r in runtime_rows]))
+        core_fps = fps_from_ms(core_mean_ms)
+        full_fps = fps_from_ms(full_mean_ms)
+    else:
+        core_mean_ms = full_mean_ms = core_fps = full_fps = 0.0
+
+    print("=" * 60)
+    print("Done.")
+    print(f"Frames processed : {frame_id}")
+    print(f"Elapsed time     : {elapsed:.2f} s")
+    print(f"Overall wall FPS : {overall_wall_fps:.2f}")
+    print(f"Inference core   : {core_mean_ms:.2f} ms/frame, {core_fps:.2f} FPS")
+    print(f"Full total       : {full_mean_ms:.2f} ms/frame, {full_fps:.2f} FPS")
+    if getattr(args, "no_vis", False):
+        print("Vis video        : disabled (--no-vis)")
+    else:
+        print(f"Vis video        : {vis_video_path}")
+    print(f"CSV              : {csv_path}")
+    print(f"Runtime CSV      : {runtime_csv_path}")
+    print(f"Runtime summary  : {runtime_summary_path}")
+    print("=" * 60)
+
+
+# =========================================================
+# 参数
+# =========================================================
+
+
+def build_parser():
+    parser = argparse.ArgumentParser("Video scale stable inference (v1)")
+    parser.add_argument("--video", type=str, required=True, help="input video path")
+    parser.add_argument("--cam-yaml", type=str, required=True, help="camera yaml file or calib directory")
+    parser.add_argument("--out-dir", type=str, default=os.path.join(ROOT, "outputs", "fusion", "video_scale_stable"))
+    parser.add_argument("--show", action="store_true")
+    parser.add_argument("--no-vis", action="store_true", help="Disable visualization video generation. Only save CSV/runtime outputs.")
+    parser.add_argument("--resize-w", type=int, default=0)
+    parser.add_argument("--undistort", action="store_true")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seg-da-weight", type=str, default=os.path.join(ROOT, "models", "ckpts", "twinlitenetpp_geodepth", "twinlitenetpp_da_best.pth"))
+    parser.add_argument("--seg-ll-weight", type=str, default=os.path.join(ROOT, "models", "ckpts", "twinlitenetpp_geodepth", "twinlitenetpp_lanegeo_best.pth"))
+    parser.add_argument("--depth-ckpt", type=str, default=os.path.join(ROOT, "models", "ckpts", "depth_anything_v2", "depth_anything_v2_vits.pth"))
+    parser.add_argument("--enable-det", action="store_true")
+    parser.add_argument("--det-ckpt", type=str, default=os.path.join(ROOT, "third_party", "yolov11n", "yolo11n.pt"))
+    parser.add_argument("--seg-input-w", type=int, default=640)
+    parser.add_argument("--seg-input-h", type=int, default=360)
+    parser.add_argument("--seg-da-thresh", type=float, default=0.5)
+    parser.add_argument("--seg-lane-thresh", type=float, default=0.5)
+    parser.add_argument("--road-open-ksize", type=int, default=3)
+    parser.add_argument("--road-close-ksize", type=int, default=7)
+    parser.add_argument("--road-min-area", type=int, default=200)
+    parser.add_argument("--lane-open-ksize", type=int, default=3)
+    parser.add_argument("--lane-close-ksize", type=int, default=5)
+    parser.add_argument("--lane-min-area", type=int, default=50)
+    parser.add_argument("--lane-center-sigma-px", type=float, default=80.0)
+    parser.add_argument("--lane-weight-alpha", type=float, default=0.35)
+    parser.add_argument("--sample-step-y", type=int, default=8)
+    parser.add_argument("--min-points-per-row", type=int, default=2)
+    parser.add_argument("--min-scale-points", type=int, default=5)
+    parser.add_argument("--support-y-ratio0", type=float, default=0.45)
+    parser.add_argument("--support-center-width-ratio", type=float, default=0.50)
+    parser.add_argument("--support-min-row-width", type=int, default=20)
+    parser.add_argument("--support-sample-step-x", type=int, default=12)
+    parser.add_argument("--hood-bottom-ratio", type=float, default=0.38)
+    parser.add_argument("--hood-center-width-ratio", type=float, default=0.92)
+    parser.add_argument("--hood-near-percentile", type=float, default=18.0)
+    parser.add_argument("--hood-open-ksize", type=int, default=3)
+    parser.add_argument("--hood-close-ksize", type=int, default=7)
+    parser.add_argument("--hood-min-area", type=int, default=300)
+    parser.add_argument("--hood-step-x", type=int, default=8)
+    parser.add_argument("--hood-smooth-ksize", type=int, default=31)
+    parser.add_argument("--hood-edge-percentile", type=float, default=90.0)
+    parser.add_argument("--hood-boundary-step-x", type=int, default=48)
+    parser.add_argument("--hood-update-interval", type=int, default=5,
+                        help="Compute expensive depth-guided hood prior every N frames; reuse cached hood mask between updates. Use 1 to disable reuse.")
+    parser.add_argument("--hood-reuse-conf-decay", type=float, default=0.98,
+                        help="Per-frame confidence decay applied when reusing cached hood prior.")
+    parser.add_argument("--hood-lock-after-frames", type=int, default=10,
+                        help="Run full hood extraction for the first N frames, then lock and reuse a static smoothed hood prior. Set <=0 to disable.")
+    parser.add_argument("--hood-lock-min-valid", type=int, default=3,
+                        help="Minimum number of valid hood curves required to lock a static hood prior.")
+    parser.add_argument("--hood-lock-min-conf", type=float, default=0.30,
+                        help="Minimum hood confidence required for a warmup curve to be used in static hood locking.")
+    parser.add_argument("--hood-lock-smooth-ksize", type=int, default=101,
+                        help="Gaussian smoothing kernel size for the locked static hood curve.")
+    parser.add_argument("--hood-lock-soft-sigma-px", type=float, default=18.0,
+                        help="Soft-mask sigmoid sigma for the locked static hood prior.")
+    parser.add_argument("--hood-lock-mode", type=str, default="median", choices=["median", "best"],
+                        help="How to build the static hood curve from warmup frames.")
+    parser.add_argument("--hood-boundary-smooth-ksize", type=int, default=31)
+    parser.add_argument("--hood-min-x-span-ratio", type=float, default=0.25)
+    parser.add_argument("--hood-min-aspect-ratio", type=float, default=1.60)
+    parser.add_argument("--hood-min-bottom-touch-ratio", type=float, default=0.08)
+    parser.add_argument("--hood-top-percentile", type=float, default=10.0)
+    parser.add_argument("--hood-curve-ema-alpha", type=float, default=0.35)
+    parser.add_argument("--hood-soft-sigma-px", type=float, default=18.0)
+    parser.add_argument("--hood-penalty-lambda", type=float, default=0.85)
+    parser.add_argument("--min-point-weight", type=float, default=0.20)
+    parser.add_argument("--target-lane-pixels", type=int, default=1500)
+    parser.add_argument("--scale-stability-k", type=float, default=4.0)
+    parser.add_argument("--scale-min-anchor-z", type=float, default=8.0)
+    parser.add_argument("--scale-max-anchor-z", type=float, default=40.0,
+                        help="Only geometry points within this Z range are used to update metric scale")
+    parser.add_argument("--far-band-as-check-only", action="store_true",
+                        help="Use far bands only for debug/checking, not for scale update")
+    parser.add_argument("--conf-high", type=float, default=0.68)
+    parser.add_argument("--conf-mid", type=float, default=0.50)
+    parser.add_argument("--alpha-fast", type=float, default=0.08)
+    parser.add_argument("--alpha-slow", type=float, default=0.025)
+    parser.add_argument("--alpha-jump", type=float, default=0.015)
+    parser.add_argument("--jump-slow-ratio", type=float, default=0.04)
+    parser.add_argument("--jump-reject-ratio", type=float, default=0.10)
+    parser.add_argument("--jump-freeze-ratio", type=float, default=0.30)
+    parser.add_argument("--init-good-frames", type=int, default=3)
+    parser.add_argument("--profile-sync-cuda", action="store_true",
+                        help="Synchronize CUDA before/after timed modules for more reliable per-module runtime profiling")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    run_video(args)
+
+
+if __name__ == "__main__":
+    main()

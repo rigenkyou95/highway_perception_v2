@@ -2,8 +2,12 @@ import os
 import sys
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple
-import yaml
+
+# 可选：YAML 相机配置读取（未安装 pyyaml 时会给出提示）
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 from typing import Tuple, Optional, List
 from dataclasses import dataclass
 import math
@@ -24,6 +28,8 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 # ============================================================
 # 是否启用“利用车道宽 3.6m 标定相机高度”的几何标定
 USE_LANE_WIDTH_CALIB = False  # 先关掉，想试再改 True
+# 临时实验：手动覆盖 pitch_deg。设为 None 则使用 YAML/标定值。
+EXPERIMENT_PITCH_OVERRIDE_DEG: Optional[float] = 0.0
 
 
 # ============================================================
@@ -129,18 +135,6 @@ cfg = Config()
 # ============================================================
 
 def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> bool:
-    """
-    从 YAML 或 calib 目录加载相机参数并写入 cfg.camera。
-
-    支持两种模式：
-    1) 单文件 YAML（旧模式）：
-        intrinsic: {fx, fy, cx, cy, dist?}
-        extrinsic: {height, pitch_deg, roll_deg?, yaw_deg?}
-
-    2) 目录模式（推荐，calib/cam_v002）：
-        intrinsics.yaml
-        extrinsics.yaml
-    """
     if cam_yaml is None or str(cam_yaml).strip() == "":
         return False
 
@@ -151,9 +145,7 @@ def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> b
 
     p = Path(cam_yaml).expanduser().resolve()
 
-    # --------------------------------------------------
-    # 情况 A：cam_yaml 是目录（推荐）
-    # --------------------------------------------------
+    # 目录模式：calib/cam_v002
     if p.is_dir():
         intr_path = p / "intrinsics.yaml"
         extr_path = p / "extrinsics.yaml"
@@ -176,9 +168,7 @@ def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> b
 
         print(f"[Camera] Loaded calib directory: {p}")
 
-    # --------------------------------------------------
-    # 情况 B：cam_yaml 是单个 YAML 文件（兼容旧模式）
-    # --------------------------------------------------
+    # 单文件模式
     elif p.is_file():
         data = yaml.safe_load(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -192,9 +182,7 @@ def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> b
     else:
         raise FileNotFoundError(f"[Camera] 找不到相机配置: {p}")
 
-    # --------------------------------------------------
     # 写入内参
-    # --------------------------------------------------
     for k in ["fx", "fy", "cx", "cy"]:
         if k in intr and intr[k] is not None:
             setattr(cfg.camera, k, float(intr[k]))
@@ -205,9 +193,7 @@ def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> b
         else:
             raise ValueError("[Camera] intrinsic.dist 需要是 list，如 [k1,k2,p1,p2,k3]")
 
-    # --------------------------------------------------
     # 写入外参
-    # --------------------------------------------------
     if "height" in ext and ext["height"] is not None:
         cfg.camera.cam_height = float(ext["height"])
     if "pitch_deg" in ext and ext["pitch_deg"] is not None:
@@ -217,9 +203,6 @@ def load_camera_from_yaml(cam_yaml: Optional[str], img_wh: Tuple[int, int]) -> b
     if "yaw_deg" in ext and ext["yaw_deg"] is not None:
         cfg.camera.yaw_deg = float(ext["yaw_deg"])
 
-    # --------------------------------------------------
-    # 一致性与提示
-    # --------------------------------------------------
     w0, h0 = img_wh
     print(f"[Camera]   fx={cfg.camera.fx:.2f}, fy={cfg.camera.fy:.2f}, "
           f"cx={cfg.camera.cx:.1f}, cy={cfg.camera.cy:.1f}")
@@ -438,20 +421,9 @@ def load_depth_model(device: str = "cuda") -> DepthAnythingV2TinyWrapper:
     return model
 
 
-def vis_depth(depth: np.ndarray, valid_mask: np.ndarray = None) -> np.ndarray:
+def vis_depth(depth: np.ndarray) -> np.ndarray:
     depth = depth.astype(np.float32)
-
-    if valid_mask is None:
-        valid = np.isfinite(depth)
-    else:
-        valid = np.isfinite(depth) & valid_mask
-
-    if valid.sum() == 0:
-        return np.zeros((depth.shape[0], depth.shape[1], 3), dtype=np.uint8)
-
-    d_min = float(np.min(depth[valid]))
-    d_max = float(np.max(depth[valid]))
-
+    d_min, d_max = depth.min(), depth.max()
     if d_max - d_min < 1e-6:
         norm = np.zeros_like(depth, dtype=np.uint8)
     else:
@@ -459,15 +431,7 @@ def vis_depth(depth: np.ndarray, valid_mask: np.ndarray = None) -> np.ndarray:
         norm = (norm * 255.0).clip(0, 255).astype(np.uint8)
 
     color = cv2.applyColorMap(255 - norm, cv2.COLORMAP_MAGMA)
-
-    # 无效区域直接涂黑
-    if valid_mask is not None:
-        color[~valid_mask] = 0
-    else:
-        color[~np.isfinite(depth)] = 0
-
     return color
-
 
 
 def infer_depth(depth_model: DepthAnythingV2TinyWrapper, img_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -529,19 +493,13 @@ def compute_geo_depth_from_seg(
 def fuse_geo_and_visual_depth(
     depth_geo: np.ndarray,
     depth_rel: np.ndarray,
-    valid_mask: np.ndarray = None,
     min_valid_points: int = 500
 ) -> Tuple[np.ndarray, float]:
-
     assert depth_geo.shape == depth_rel.shape, "几何深度与视觉深度尺寸不一致"
 
     mask_geo = np.isfinite(depth_geo) & (depth_geo > 0)
     mask_rel = depth_rel > 1e-6
     mask = mask_geo & mask_rel
-
-    if valid_mask is not None:
-       mask = mask & valid_mask
-
 
     num_valid = int(mask.sum())
     print(f"[Fusion] 有效几何点数: {num_valid}")
@@ -573,6 +531,36 @@ def fuse_geo_and_visual_depth(
     depth_abs = depth_rel.astype(np.float32) * s
     return depth_abs, s
 
+def ensure_binary_mask_2d(m: np.ndarray) -> np.ndarray:
+    """
+    把输入 mask 统一成 2D uint8(0/1)。
+    支持:
+      - (H,W)
+      - (H,W,1)
+      - (H,W,3)
+      - (H,W,4)
+    """
+    if m is None:
+        raise ValueError("mask is None")
+
+    m = np.asarray(m)
+
+    # (H,W,1) → (H,W)
+    if m.ndim == 3 and m.shape[2] == 1:
+        m = np.squeeze(m, axis=2)
+
+    # 彩色 → 灰度
+    if m.ndim == 3 and m.shape[2] == 3:
+        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+    elif m.ndim == 3 and m.shape[2] == 4:
+        m = cv2.cvtColor(m, cv2.COLOR_BGRA2GRAY)
+
+    if m.ndim != 2:
+        raise ValueError(f"mask must be 2D after conversion, got shape={m.shape}")
+
+    # 转成 0/1
+    m = (m > 0).astype(np.uint8)
+    return m
 
 # ============================================================
 # 简单 1D KMeans（供标定、聚类车道线用）
@@ -719,17 +707,19 @@ def prepare_lane_mask_for_pitch(ll_mask: np.ndarray,
 def collect_lane_width_samples(
     ll_mask: np.ndarray,
     cam_cfg: CameraConfig,
-    row_ratio: float = 0.7,
-    window: int = 60,
-    max_K: int = 4
+    row_ratio: float = 0.78,
+    window: int = 90,
+    max_K: int = 6
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     从车道线 mask 中收集一批 (y, dx_pix) 样本：
       - y: 图像行号
       - dx_pix: 该行中“相邻两条车道线之间的最小像素宽度”
-    ll_mask 应为“中心线版”（单像素宽）。
+    ll_mask 可以是 2D/3D，内部会统一转成 2D binary。
     """
+    ll_mask = ensure_binary_mask_2d(ll_mask)
     h, w = ll_mask.shape
+
     y_center = int(h * row_ratio)
     ys = range(max(0, y_center - window), min(h, y_center + window + 1))
 
@@ -754,21 +744,24 @@ def collect_lane_width_samples(
 
         centers = np.sort(np.array(centers, dtype=np.float32))
 
-        band_min = w * 0.20
-        band_max = w * 0.80
+        band_min = w * 0.10
+        band_max = w * 0.90
         centers = centers[(centers > band_min) & (centers < band_max)]
         if len(centers) < 2:
             continue
 
         diffs = np.diff(centers)
-        diffs = diffs[(diffs > 40) & (diffs < 180)]
+
+        # 放宽阈值：当前你的真实观测宽度已经到 282 px，180 会直接把它过滤掉
+        diffs = diffs[(diffs > 60) & (diffs < 420)]
         if diffs.size == 0:
             continue
 
         dx_pix = float(np.median(diffs))
         ys_list.append(float(y))
         dx_list.append(dx_pix)
-
+    # Debug
+    print(f"[LaneWidth Debug] candidate rows={len(list(ys))}, collected={len(ys_list)}")
     if not ys_list:
         return np.array([]), np.array([])
 
@@ -1248,15 +1241,6 @@ def run_full_pipeline(img_path: str, cam_yaml: Optional[str] = None):
         raise RuntimeError(f"无法读取图像: {img_path}")
     h0, w0 = img_bgr.shape[:2]
     print(f"Input size: {w0}x{h0}")
-    # ---- 有效像素mask：黑边/纯黑区域不参与热力计算 ----
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    valid_mask = gray > 5  # 阈值：3~10（黑边很黑用5就够）
-
-    # 可选：腐蚀一圈，防止黑边附近插值带影响
-    valid_mask = cv2.erode(valid_mask.astype(np.uint8), np.ones((7, 7), np.uint8), iterations=1).astype(bool)
-
-    print(f"[Mask] valid pixels ratio = {valid_mask.mean()*100:.2f}%")
-
 
     # 0) 读取真实相机参数（若提供 YAML），否则使用 FOV 兜底
     _loaded = load_camera_from_yaml(cam_yaml, img_wh=(w0, h0))
@@ -1297,7 +1281,7 @@ def run_full_pipeline(img_path: str, cam_yaml: Optional[str] = None):
     da_thr=0.35, ll_thr=0.5, postproc_da=False
     )
 
-    # 1.3 叠加可视化：DA 用 da_mask，Lane 用 lanegeo 的 ll_mask_lane
+        # 1.3 叠加可视化：DA 用 da_mask，Lane 用 lanegeo 的 ll_mask_lane
     seg_overlay = build_seg_overlay(img_bgr, da_mask, ll_mask_lane)
 
     # 保存原始车道线 mask（lanegeo）
@@ -1308,17 +1292,32 @@ def run_full_pipeline(img_path: str, cam_yaml: Optional[str] = None):
     # ==== 1.x 车道线中心线提取 + 护栏过滤 → ll_mask_pitch ====
     ll_mask_pitch = prepare_lane_mask_for_pitch(ll_mask_lane, save_debug=True)
 
-    # 1.x.a 一致性检查：用 3.6m 车道宽评估当前相机参数（仅报告误差，不自动优化）
-    _lane_check = evaluate_lane_width_consistency(ll_mask_pitch, cfg.camera, lane_width_m=3.6)
+    # ===== 临时实验：手动覆盖 pitch_deg（必须放在 consistency check 之前）=====
+    if EXPERIMENT_PITCH_OVERRIDE_DEG is not None:
+        cfg.camera.pitch_deg = float(EXPERIMENT_PITCH_OVERRIDE_DEG)
+
+    print(f"[Camera] 使用 pitch_deg = {cfg.camera.pitch_deg:.2f}°")
+
+    # 1.x.a 一致性检查：优先用 filtered（不是 thin）
+    pitch_filtered_path = os.path.join(cfg.out_fusion, "ll_pitch_filtered.png")
+    if os.path.isfile(pitch_filtered_path):
+        ll_for_check = cv2.imread(pitch_filtered_path, cv2.IMREAD_GRAYSCALE)
+    else:
+        ll_for_check = ll_mask_lane
+
+    ll_for_check = ensure_binary_mask_2d(ll_for_check)
+
+    _lane_check = evaluate_lane_width_consistency(
+        ll_for_check,
+        cfg.camera,
+        lane_width_m=3.6
+    )
 
     if np.count_nonzero(ll_mask_pitch) < 50:
         print("[Pitch] ll_mask_pitch 几乎为空，改用 lanegeo 原始 ll_mask_lane 进行 pitch 拟合。")
         ll_mask_pitch = (ll_mask_lane > 0).astype(np.uint8) * 255
         cv2.imwrite(os.path.join(cfg.out_fusion, "ll_pitch_fallback.png"), ll_mask_pitch)
 
-    # 如果你在 YAML 中已提供 pitch_deg，这里就不要再覆盖。
-    # 如需临时测试，可手动设置：cfg.camera.pitch_deg = 5.0
-    print(f"[Camera] 使用 pitch_deg = {cfg.camera.pitch_deg:.2f}°")
     # 1.x 利用 3.6m 车道宽自动拟合俯仰角
 #    cfg.camera.pitch_deg = estimate_pitch_from_lane_width(
 #        ll_mask_pitch, cfg.camera, lane_width_m=3.6,
@@ -1334,26 +1333,17 @@ def run_full_pipeline(img_path: str, cam_yaml: Optional[str] = None):
 
     # 2) 几何深度（仍然使用 DA mask）
     print("[Step 2] 几何深度 D_geo ...")
-    da_mask_valid = ((da_mask > 0) & valid_mask).astype(np.uint8)
-    depth_geo = compute_geo_depth_from_seg(da_mask_valid, ll_mask_pitch, cfg.camera)
-
+    depth_geo = compute_geo_depth_from_seg(da_mask, ll_mask_pitch, cfg.camera)
 
     # 3) 视觉深度
     print("[Step 3] DepthAnything 相对深度 D_rel ...")
     depth_model = load_depth_model(device=device)
-    depth_rel, _ = infer_depth(depth_model, img_bgr)
-    depth_vis_rel = vis_depth(depth_rel, valid_mask=valid_mask)
-
+    depth_rel, depth_vis_rel = infer_depth(depth_model, img_bgr)
 
     # 4) 融合
     print("[Step 4] 几何流 + 视觉流 融合 → D_abs ...")
-    depth_abs, scale_s = fuse_geo_and_visual_depth(
-         depth_geo,
-         depth_rel,
-         valid_mask=valid_mask
-    )
-    depth_vis_abs = vis_depth(depth_abs, valid_mask=valid_mask)
-
+    depth_abs, scale_s = fuse_geo_and_visual_depth(depth_geo, depth_rel)
+    depth_vis_abs = vis_depth(depth_abs)
 
     # 5) YOLO 检测 + 距离估计
     print("[Step 5] YOLOv11n 检测 + 距离估计 ...")
